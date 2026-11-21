@@ -77,7 +77,8 @@ Target: dns.google -> 8.8.8.8
 ## Features
 
 - **Track Signal.** Live traceroute over ICMP, TCP SYN or UDP. The table fills in as replies
-  arrive, scrolls, follows new hops and marks the target's verdict (`open`, `closed` or `!U`).
+  arrive, scrolls, follows new hops and marks the verdict (`open` or `closed`, or an unreachable
+  mark such as `!H`).
 - **Send Signal.** Continuous ping over the same three protocols with a rolling result window
   and live min / avg / max and packet-loss statistics. Over TCP it measures SYN to SYN-ACK, which
   still works where ICMP is filtered.
@@ -198,16 +199,33 @@ benchmark it.
   for private addresses with the address itself. Those names are hidden.
 - A resolver that rewrites NXDOMAIN answers can make a mistyped hostname resolve to some other
   address. The target line above the table always shows the IP actually in use.
-- Every Destination Unreachable code shows as `!U`. Routers also rate limit these messages, so a
-  ping to an unreachable host may show `unreachable` once and `timeout` after that.
+- Routers rate limit Destination Unreachable messages too. Right after a parallel trace has used
+  up that budget, a ping to an unreachable host can show `timeout` instead of `unreachable`.
+
+## Unreachable marks
+
+A Destination Unreachable stops the trace at the hop that sent it, in every protocol. The code in
+the message picks the mark, the same way Linux traceroute does.
+
+| Mark | ICMP codes | Meaning                                          |
+|------|------------|--------------------------------------------------|
+| `!N` | 0, 6, 11   | Network unreachable or unknown                   |
+| `!H` | 1, 7, 12   | Host unreachable or unknown                      |
+| `!X` | 9, 10, 13  | Administratively prohibited (a filter said no)   |
+| `!P` | 2          | Protocol unreachable                             |
+| `!F` | 4          | Fragmentation needed but DF was set              |
+| `!U` | any other  | Some other unreachable                           |
+
+Over UDP, a Port Unreachable (code 3) from the target means the trace arrived and the port is
+closed, so it shows as `closed` instead.
 
 ## Status
 
-Traceroute and ping over ICMP, TCP and UDP, DNS, scrolling and parallel probing all work. In every
-protocol a Destination Unreachable stops the trace at the hop that sent it.
+Traceroute and ping over ICMP, TCP and UDP, DNS, scrolling, parallel probing and per-code
+unreachable marks all work.
 
-Not done yet are IPv6, a Paris-style UDP mode (a fixed source port with the tag moved into the
-checksum field) and separate marks per unreachable code (`!N`, `!H`, `!X`).
+Not done yet are IPv6 and a Paris-style UDP mode (a fixed source port with the tag moved into the
+checksum field).
 
 ## Requirements & notes
 

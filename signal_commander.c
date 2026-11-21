@@ -58,11 +58,11 @@ typedef struct {
     char   ip[INET_ADDRSTRLEN];  // Empty means no probe answered, row shows * * *
     double rtt[MAX_PROBES];      // -1 = that probe timed out
     int    reached;              // 1 = the target itself answered
-    char   flag;                 // TCP/UDP: 'O' open, 'C' closed, 'U' unreachable. 0 = plain hop
+    char   flag;                 // 'O' open, 'C' closed, 'N' 'H' 'X' 'P' 'F' 'U' unreachable kinds. 0 = plain hop
     char   name[64];             // PTR name, empty when DNS is off or nothing came back
 } HopResult;
 
-// One ping result. ok=0 means timeout (or unreachable when flag is 'U').
+// One ping result. ok=0 means timeout, or unreachable when flag is one of the unreachable kinds.
 typedef struct {
     int    seq;
     double rtt;
@@ -642,22 +642,41 @@ void open_settings(void) {
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Track Signal Table __________________________________________________________________________
-// Turns a flag letter into screen text
+// Turns a flag letter into screen text. The unreachable marks follow Linux traceroute.
 static const char *flag_text(char f) {
-    if (f == 'O') return "open";
-    if (f == 'C') return "closed";
-    if (f == 'U') return "!U";
+    switch (f) {
+        case 'O': return "open";
+        case 'C': return "closed";
+        case 'N': return "!N";                   // Network unreachable
+        case 'H': return "!H";                   // Host unreachable
+        case 'X': return "!X";                   // Administratively prohibited, a filter said no
+        case 'P': return "!P";                   // Protocol unreachable
+        case 'F': return "!F";                   // Fragmentation needed but DF was set
+        case 'U': return "!U";                   // Any other unreachable code
+    }
     return "";
 }
 
 // When one hop gets several verdicts the strongest stays. Only a listening port sends SYN-ACK,
 // so that is the strongest proof. Then the target's RST or port unreachable, weakest is an
-// unreachable from somewhere on the path.
+// unreachable from somewhere on the path. All unreachable kinds rank the same.
 static int flag_rank(char f) {
     if (f == 'O') return 3;
     if (f == 'C') return 2;
-    if (f == 'U') return 1;
+    if (f && strchr("NHXPFU", f)) return 1;      // f first, strchr would match the terminator on 0
     return 0;
+}
+
+// Maps a Destination Unreachable code (RFC 792, RFC 1812) to its flag letter
+static char unreach_flag(int code) {
+    switch (code) {
+        case 0: case 6: case 11: return 'N';     // Net unreachable, net unknown, net for TOS
+        case 1: case 7: case 12: return 'H';     // Host unreachable, host unknown, host for TOS
+        case 9: case 10: case 13: return 'X';    // Net, host or communication prohibited
+        case 2:                  return 'P';
+        case 4:                  return 'F';
+    }
+    return 'U';
 }
 
 // scroll_off is the hop index at the top of the table. While follow is 1 every draw sticks to
@@ -960,7 +979,7 @@ static int parse_icmp(char *buf, int n, struct sockaddr_in *from, Engine *m, int
         if (icmp->type == ICMP_DEST_UNREACH) {              // The trace ends here
             *reached_out = 1;
             *flag_out = (m->proto == IPPROTO_UDP && icmp->code == ICMP_PORT_UNREACH)
-                      ? 'C' : 'U';                          // UDP port unreachable = reached, port closed
+                      ? 'C' : unreach_flag(icmp->code);     // UDP port unreachable = reached, port closed
         }
         else *reached_out = 0;
     } else return 0;                                        // Unrelated ICMP
@@ -1499,7 +1518,9 @@ static void draw_ping(const char *target_ip, const char *target_str, const char 
         mvaddch(ry, x, ACS_VLINE); mvaddch(ry, x + w - 1, ACS_VLINE);
         if (p->ok)              mvprintw(ry, x + 2, "%3d    time=%.2f ms  %s", p->seq, p->rtt,
                                          flag_text(p->flag));   // open / closed for TCP
-        else if (p->flag == 'U') mvprintw(ry, x + 2, "%3d    unreachable", p->seq);
+        else if (flag_rank(p->flag) == 1)
+                                mvprintw(ry, x + 2, "%3d    unreachable %s", p->seq,
+                                         flag_text(p->flag));   // !N, !H, !X ...
         else                    mvprintw(ry, x + 2, "%3d    timeout", p->seq);
     }
 
@@ -1559,7 +1580,7 @@ void send_signal(void) {
                 struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
                 double rtt = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
                              (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
-                if (flag == 'U') {                                  // Path cut, does not count as a success
+                if (flag_rank(flag) == 1) {                         // Path cut, does not count as a success
                     ring[ring_count % PING_RING] = (PingRow){ seq, rtt, 0, flag };
                 } else {
                     ring[ring_count % PING_RING] = (PingRow){ seq, rtt, 1, flag };
