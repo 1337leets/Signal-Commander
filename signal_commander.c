@@ -937,7 +937,7 @@ static int parse_icmp(char *buf, int n, struct sockaddr_in *from, Engine *m, int
         if (n < off + iiplen + 8) return 0;                 // Only 8 bytes are promised
 
         if (m->proto == IPPROTO_ICMP) {
-            if (icmp->type != ICMP_TIME_EXCEEDED) return 0; // ICMP mode still ignores unreachable, as before
+            if (iip->daddr != m->target.sin_addr.s_addr) return 0;          // Echo to some other target
             struct icmphdr *iicmp = (struct icmphdr *)(buf + off + iiplen); // My original echo header, buried inside
             if (ntohs(iicmp->un.echo.id) != m->my_id) return 0;             // Not my probe
             *tag_out = ntohs(iicmp->un.echo.sequence);

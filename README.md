@@ -198,14 +198,16 @@ benchmark it.
   for private addresses with the address itself. Those names are hidden.
 - A resolver that rewrites NXDOMAIN answers can make a mistyped hostname resolve to some other
   address. The target line above the table always shows the IP actually in use.
-- ICMP mode still ignores Destination Unreachable replies.
+- Every Destination Unreachable code shows as `!U`. Routers also rate limit these messages, so a
+  ping to an unreachable host may show `unreachable` once and `timeout` after that.
 
 ## Status
 
-Traceroute and ping over ICMP, TCP and UDP, DNS, scrolling and parallel probing all work.
+Traceroute and ping over ICMP, TCP and UDP, DNS, scrolling and parallel probing all work. In every
+protocol a Destination Unreachable stops the trace at the hop that sent it.
 
 Not done yet are IPv6, a Paris-style UDP mode (a fixed source port with the tag moved into the
-checksum field) and handling Destination Unreachable in ICMP mode.
+checksum field) and separate marks per unreachable code (`!N`, `!H`, `!X`).
 
 ## Requirements & notes
 
