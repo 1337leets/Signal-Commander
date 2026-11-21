@@ -1,6 +1,7 @@
 # compiled binaries
 signal_commander
 trace
+tcptrace
 *.o
 *.out
 a.out
