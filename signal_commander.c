@@ -19,6 +19,7 @@
 #include <netinet/tcp.h>      /* struct tcphdr */
 #include <netinet/udp.h>      /* struct udphdr */
 #include <stdint.h>           /* uint16_t, uint32_t */
+#include <fcntl.h>            /* open, /dev/urandom icin */
 
 #define MAX_HOPS    30
 #define MAX_PROBES  5            /* HopResult dizisinin boyutu, Settings bunun altinda kalir */
@@ -43,9 +44,10 @@ static Config current_cfg = {"127.0.0.1", 80, 64, "ICMP"};
 typedef struct {
     int probes;                  /* hop basina probe, 1..MAX_PROBES */
     int timeout_ms;              /* track'te probe basina cevap penceresi */
+    int dns;                     /* 1 = hostname hedef + hop isimleri (PTR) */
 } Ayar;
 
-static Ayar ayar = { 3, 2000 };
+static Ayar ayar = { 3, 2000, 0 };
 
 /* Bir hop: ayar.probes kadar probe'un sonucu tek satirda */
 typedef struct {
@@ -54,6 +56,7 @@ typedef struct {
     double rtt[MAX_PROBES];      /* -1 = o probe timeout */
     int    reached;              /* 1 = hedefin kendisi cevapladi */
     char   flag;                 /* TCP/UDP: 'O' acik, 'C' kapali, 'U' ulasilamaz. 0 = duz hop */
+    char   name[64];             /* PTR ismi, DNS kapaliysa ya da bulunamadiysa bos */
 } HopResult;
 
 /* Bir ping sonucu: seq numarasi + rtt. ok=0 ise timeout (flag 'U' ise unreachable) */
@@ -71,8 +74,9 @@ typedef struct {
  *  FLD_INT   : tam sayı, min_val..max_val
  *  FLD_STR   : printable ASCII serbest metin
  *  FLD_CYCLE : önceden tanımlı seçenekler arasında ←/→ ile gezinme
+ *  FLD_HOST  : IPv4 ya da hostname (harf, rakam, nokta, tire)
  * ═══════════════════════════════════════════════════ */
-typedef enum { FLD_STR, FLD_INT, FLD_IP, FLD_CYCLE } FldType;
+typedef enum { FLD_STR, FLD_INT, FLD_IP, FLD_CYCLE, FLD_HOST } FldType;
 
 typedef struct {
     const char  *label;
@@ -85,21 +89,23 @@ typedef struct {
 } FldMeta;
 
 static const char *PROTO_OPTS[] = { "ICMP", "TCP", "UDP" };
+static const char *ONOFF_OPTS[] = { "OFF", "ON" };
 
 #define CFG_FIELDS 4
 
 static const FldMeta FIELDS[CFG_FIELDS] = {
-    { "Target Host", FLD_IP,    15, 0,     0, NULL,       0 },
+    { "Target Host", FLD_HOST,  31, 0,     0, NULL,       0 },   /* 31 = value hucresine sigan */
     { "Port",        FLD_INT,    5, 0, 65535, NULL,       0 },
     { "TTL",         FLD_INT,    3, 0,   255, NULL,       0 },
     { "Protocol",    FLD_CYCLE,  0, 0,     0, PROTO_OPTS, 3 },
 };
 
-#define AYAR_FIELDS 2
+#define AYAR_FIELDS 3
 
 static const FldMeta AYAR_META[AYAR_FIELDS] = {
-    { "Probes per hop",   FLD_INT, 1,   1, MAX_PROBES, NULL, 0 },
-    { "Hop timeout (ms)", FLD_INT, 5, 100,      10000, NULL, 0 },
+    { "Probes per hop",   FLD_INT,   1,   1, MAX_PROBES, NULL,       0 },
+    { "Hop timeout (ms)", FLD_INT,   5, 100,      10000, NULL,       0 },
+    { "Resolve DNS",      FLD_CYCLE, 0,   0,          0, ONOFF_OPTS, 2 },
 };
 
 /* Bir formun tarifi: baslik, alan tablosu, veri <-> string cevirileri.
@@ -118,6 +124,7 @@ static void ayar_to_str(const void *d, int idx, char *out, int outlen) {
     switch (idx) {
         case 0: snprintf(out, outlen, "%d", a->probes);     break;
         case 1: snprintf(out, outlen, "%d", a->timeout_ms); break;
+        case 2: snprintf(out, outlen, "%s", a->dns ? "ON" : "OFF"); break;
     }
 }
 
@@ -127,6 +134,7 @@ static void str_to_ayar(void *d, int idx, const char *s) {
     switch (idx) {
         case 0: a->probes     = atoi(s); break;
         case 1: a->timeout_ms = atoi(s); break;
+        case 2: a->dns        = (strcmp(s, "ON") == 0); break;
     }
 }
 
@@ -307,6 +315,30 @@ static int validate_ipv4(const char *s) {
     return (octets == 4);
 }
 
+/* IPv4 ya da hostname mi? Sadece rakam + nokta ise IPv4 olmak zorunda
+ * (1.2.3 gibi yarim adresler isim sayilmasin). Isimde etiket 1-63,
+ * tire ile baslayamaz ya da bitemez, bos etiket yok. */
+static int validate_host(const char *s) {
+    int harf = 0;
+    for (const char *p = s; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || *p == '.')) harf = 1;
+    if (!harf) return validate_ipv4(s);
+
+    int len = 0; char prev = '.';
+    for (const char *p = s; ; p++) {
+        if (*p == '.' || *p == '\0') {
+            if (len == 0 || len > 63 || prev == '-') return 0;
+            len = 0;
+            if (*p == '\0') break;
+        } else {
+            if (len == 0 && *p == '-') return 0;
+            len++;
+        }
+        prev = *p;
+    }
+    return 1;
+}
+
 /* ═══════════════════════════════════════════════════
  *  CONFIG EKRANI — STATE MACHINE
  * ═══════════════════════════════════════════════════ */
@@ -442,6 +474,13 @@ static int read_text(int y, int x, const FldMeta *meta, char *buf) {
                 }
             }
 
+            if (meta->type == FLD_HOST && len > 0) {
+                if (!validate_host(buf)) {
+                    show_error("Invalid IPv4 or hostname");
+                    continue;
+                }
+            }
+
             clear_status();
             break;
         }
@@ -489,6 +528,9 @@ static int read_text(int y, int x, const FldMeta *meta, char *buf) {
                 if (!(len == 1 && buf[0] == '0'))
                     accept = 1;
             }
+        } else if (meta->type == FLD_HOST) {      /* kalan kurallar ENTER'da validate_host'ta */
+            accept = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') || c == '.' || c == '-';
         } else {
             accept = (c >= 32 && c <= 126);
         }
@@ -651,13 +693,15 @@ static const char *flag_yazi(char f) {
  * her cizimde en alta yapisir (yeni hop'lar hep gorunur). Sinirlar burada
  * kirpilir, cunku kac satir sigdigini sadece cizim ani biliyor. */
 static void draw_track(HopResult *hops, int count, int running, const char *etiket, int probes,
-                       int *scroll_off, int *takip) {
+                       int *scroll_off, int *takip, int dns_on, const char *hedef_yazi) {
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
 
     int flag_x = 24 + probes * 10;                 /* RTT kolonlarindan sonra karar kolonu */
-    int w = flag_x + 8; if (w > cols - 4) w = cols - 4;   /* 3 probe'da 62, eskisiyle ayni */
+    int name_x = flag_x + 7;                       /* DNS aciksa en sagda isim kolonu */
+    int w = flag_x + 8 + (dns_on ? 25 : 0);        /* 3 probe + DNS kapali = 62, eskisiyle ayni */
+    if (w > cols - 4) w = cols - 4;
     int x = (cols - w) / 2; if (x < 2) x = 2;
     int y = 2;
 
@@ -670,6 +714,8 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
     int max_off = count - shown;            /* en alttaki pencere */
     if (*takip || *scroll_off >= max_off) { *scroll_off = max_off; *takip = 1; } /* dibe gelince takibe don */
     if (*scroll_off < 0) *scroll_off = 0;
+
+    mvprintw(y - 1, x, "Target: %s", hedef_yazi);   /* hostname ise cozulen IP de, hijack gozden kacmasin */
 
     /* ust cerceve + basliklar */
     draw_hline(y, x, w, ACS_ULCORNER, ACS_URCORNER, -1, 0);
@@ -687,6 +733,7 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
         char lbl[8]; snprintf(lbl, sizeof(lbl), "RTT %d", p + 1);
         mvprintw(y + 1, x + 24 + p * 10, "%6s", lbl);
     }
+    if (dns_on && name_x + 4 < w - 1) mvprintw(y + 1, x + name_x, "NAME");
     attroff(A_BOLD);
 
     draw_hline(y + 2, x, w, ACS_LTEE, ACS_RTEE, -1, 0);  /* baslik ayiraci */
@@ -708,6 +755,9 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
             }
             if (h->flag && flag_x + 6 < w - 1)          /* TCP/UDP karari, cerceveye tasmasin */
                 mvprintw(ry, x + flag_x, "%s", flag_yazi(h->flag));
+            int yer = w - name_x - 2;                   /* isim kolonunda kalan yer */
+            if (dns_on && h->name[0] && yer > 0)        /* uzun isim kirpilir, cerceve bozulmaz */
+                mvprintw(ry, x + name_x, "%.*s", yer, h->name);
         }
     }
 
@@ -991,13 +1041,12 @@ static int cevap_oku(Motor *m, int tag, int tick_us,
 
 /* Config'e gore motoru kur. Hata varsa ekranda gosterilecek mesaji
  * doner, yoksa NULL. Hata durumunda da motor_kapat cagrilmali. */
-static const char *motor_ac(Motor *m) {
+static const char *motor_ac(Motor *m, struct in_addr hedef_ip) {
     static int oturum = 0;                     /* her oturum yeni kaynak port */
     memset(m, 0, sizeof(*m));
     m->isock = m->tsock = -1;
     m->hedef.sin_family = AF_INET;
-    if (inet_pton(AF_INET, current_cfg.ip, &m->hedef.sin_addr) <= 0)
-        return "Invalid target IP. Set a valid IPv4 in Configuration.";
+    m->hedef.sin_addr   = hedef_ip;            /* hedef_coz cozdu, hostname ise DNS ile */
 
     if      (strcmp(current_cfg.proto, "TCP") == 0) m->proto = IPPROTO_TCP;
     else if (strcmp(current_cfg.proto, "UDP") == 0) m->proto = IPPROTO_UDP;
@@ -1045,6 +1094,261 @@ static void motor_hata(const char *msg) {
 }
 
 /* ═══════════════════════════════════════════════════
+ *  DNS MOTORU  (elle kurulan sorgular)
+ *
+ *  dnsq.c'den gelen kanitlanmis kutular. Sorguyu bayt
+ *  bayt kuruyoruz, resolv.conf'taki sunucuya duz UDP ile
+ *  atiyoruz, cevabi sikistirilmis isimler dahil elle
+ *  cozuyoruz.
+ *
+ *  Bloklamaz: soket tick dongusunde MSG_DONTWAIT ile
+ *  yoklaniyor. getaddrinfo gibi UI'yi dondurmuyor
+ *  (NXDOMAIN ~1 sn surebiliyor, olculdu).
+ *
+ *  Kimlik: rastgele 16 bit ID. DNS'te el sikisma yok,
+ *  sahte cevabi durduran tek sey ID + kaynak port.
+ * ═══════════════════════════════════════════════════ */
+#define DNS_PORT        53
+#define DNS_TIMEOUT_MS  2000
+#define T_A             1
+#define T_PTR           12
+#define DNS_MAX_ATLAMA  16             /* isim basina takip edilen pointer, otesi dongu sayilir */
+
+static double ms_fark(struct timespec a, struct timespec b) {
+    return (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_nsec - a.tv_nsec) / 1000000.0;
+}
+
+/* resolv.conf'taki ilk IPv4 nameserver'a connect edilmis UDP soketi. -1 = yok */
+static int dns_ac(void) {
+    FILE *f = fopen("/etc/resolv.conf", "r");
+    if (!f) return -1;
+    char line[256], ip[64]; struct sockaddr_in ns; memset(&ns, 0, sizeof(ns));
+    int ok = 0;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, " nameserver %63s", ip) == 1 && inet_pton(AF_INET, ip, &ns.sin_addr) == 1) { ok = 1; break; }
+    fclose(f);
+    if (!ok) return -1;
+    ns.sin_family = AF_INET; ns.sin_port = htons(DNS_PORT);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    if (connect(s, (struct sockaddr *)&ns, sizeof(ns)) < 0) { close(s); return -1; } /* sadece sunucunun cevabi girer */
+    return s;
+}
+
+/* Tahmin edilebilir ID = cache poisoning, o yuzden kernel RNG */
+static uint16_t rastgele_id(void) {
+    uint16_t id = 0; int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0 || read(fd, &id, sizeof(id)) != sizeof(id))
+        id = (uint16_t)(getpid() ^ time(NULL));
+    if (fd >= 0) close(fd);
+    return id;
+}
+
+/* "www.google.com" -> 3www6google3com0. -1 = bos / uzun etiket ya da isim */
+static int isim_yaz(const char *name, unsigned char *out, int cap) {
+    int n = 0; const char *p = name;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        int len = dot ? (int)(dot - p) : (int)strlen(p);
+        if (len == 0 || len > 63) return -1;                       /* cift nokta ya da 6 bit siniri */
+        if (n + 1 + len + 1 > cap || n + 1 + len + 1 > 255) return -1;
+        out[n++] = (unsigned char)len;                             /* uzunluk bayti, sonra etiket */
+        memcpy(out + n, p, len); n += len;
+        p += len; if (*p == '.') p++;
+    }
+    if (n + 1 > cap) return -1;
+    out[n++] = 0;                                                  /* root etiketi, isim biter */
+    return n;
+}
+
+/* Tek sorgu kur ve at. Header struct'siz, bayt bayt: endian / padding derdi yok.
+ * id_out'a eslestirme icin ID yazar. 0 = isim bozuk ya da send patladi */
+static int dns_sor(int s, const char *qname, uint16_t qtype, uint16_t *id_out) {
+    unsigned char q[300]; uint16_t id = rastgele_id();
+    memset(q, 0, 12);
+    q[0] = id >> 8; q[1] = id & 0xFF;          /* ID, cevap ayni ID'yi tasimali */
+    q[2] = 0x01;                               /* RD=1, ozyinelemeyi resolver yapsin */
+    q[5] = 1;                                  /* QDCOUNT = 1 */
+    int n = isim_yaz(qname, q + 12, sizeof(q) - 12 - 4);
+    if (n < 0) return 0;
+    int off = 12 + n;
+    q[off++] = qtype >> 8; q[off++] = qtype & 0xFF;     /* QTYPE */
+    q[off++] = 0;          q[off++] = 1;                /* QCLASS = IN */
+    if (send(s, q, off, 0) != off) return 0;
+    *id_out = id;
+    return 1;
+}
+
+/* 8.8.4.4 -> 4.4.8.8.in-addr.arpa, agac agdan asagi yurunsun diye ters */
+static void ptr_isim(struct in_addr a, char *out, int cap) {
+    unsigned char *b = (unsigned char *)&a.s_addr;
+    snprintf(out, cap, "%u.%u.%u.%u.in-addr.arpa", b[3], b[2], b[1], b[0]);
+}
+
+/* Sikistirilmis olabilen ismi off'tan oku. Donen: ismin kayittaki sonu
+ * (pointer'in ziplattigi yer degil), bozuksa -1. Pointer'lar geri gostermeli
+ * ve sayisi sinirli, yoksa ileri yururken ayni pointer'a donup dongu kurulabilir.
+ * Basilamayan karakter '?' olur, PTR icinde escape kodu ekrani bozmasin. */
+static int isim_oku(const unsigned char *msg, int len, int off, char *out, int cap) {
+    int pos = off, end = -1, w = 0, jumps = 0;
+    if (cap < 1) return -1;
+    while (1) {
+        if (pos >= len) return -1;
+        unsigned char c = msg[pos];
+        if (c == 0) { pos++; break; }                           /* root, isim bitti */
+        if ((c & 0xC0) == 0xC0) {                               /* 11xxxxxx = 14 bit pointer */
+            if (pos + 1 >= len) return -1;
+            int target = ((c & 0x3F) << 8) | msg[pos + 1];
+            if (end < 0) end = pos + 2;
+            if (target >= pos || ++jumps > DNS_MAX_ATLAMA) return -1;
+            pos = target; continue;
+        }
+        if (c & 0xC0) return -1;                                /* 01 ve 10 onekleri rezerve */
+        if (pos + 1 + c > len) return -1;
+        if (w + (w ? 1 : 0) + c + 1 > cap) return -1;
+        if (w) out[w++] = '.';
+        for (int i = 0; i < c; i++) {
+            unsigned char ch = msg[pos + 1 + i];
+            out[w++] = (ch > 32 && ch < 127) ? (char)ch : '?';
+        }
+        pos += 1 + c;
+    }
+    out[w] = '\0';
+    return (end >= 0) ? end : pos;
+}
+
+/* Cevabi coz (ID'yi cagiran eslestirdi). qtype'tan ilk kaydi out'a yazar:
+ * A ise IP metni, PTR ise isim. 1 = bulundu, 0 = yok / NXDOMAIN / bozuk.
+ * CNAME zinciri atlanir, resolver A kaydini zincirin sonuna koyuyor. */
+static int dns_coz(const unsigned char *msg, int len, uint16_t qtype, char *out, int cap) {
+    if (len < 12) return 0;
+    int flags = (msg[2] << 8) | msg[3];
+    if (!(flags & 0x8000) || (flags & 0x0F)) return 0;      /* cevap degil ya da rcode != NOERROR */
+    int qd = (msg[4] << 8) | msg[5], an = (msg[6] << 8) | msg[7];
+    int off = 12; char isim[256];
+    for (int i = 0; i < qd; i++) {                          /* geri yansitilan soruyu atla */
+        off = isim_oku(msg, len, off, isim, sizeof(isim));
+        if (off < 0 || off + 4 > len) return 0;
+        off += 4;
+    }
+    for (int i = 0; i < an; i++) {
+        off = isim_oku(msg, len, off, isim, sizeof(isim));
+        if (off < 0 || off + 10 > len) return 0;            /* type, class, ttl, rdlength */
+        int type  = (msg[off] << 8) | msg[off + 1];
+        int rdlen = (msg[off + 8] << 8) | msg[off + 9];
+        off += 10;
+        if (off + rdlen > len) return 0;                    /* RDATA paketten uzun */
+        if (type == qtype && qtype == T_A && rdlen == 4) {
+            inet_ntop(AF_INET, msg + off, out, cap);
+            return 1;
+        }
+        if (type == qtype && qtype == T_PTR) {
+            if (isim_oku(msg, len, off, isim, sizeof(isim)) < 0) return 0;
+            snprintf(out, cap, "%s", isim);
+            return 1;
+        }
+        off += rdlen;
+    }
+    return 0;
+}
+
+/* Hedefi IP'ye cevir. IPv4 ise aninda. Hostname ise A sorgusu atar, tick tick
+ * bekler (UI donmaz, ESC iptal eder). 1 = out dolu, 0 = iptal ya da hata
+ * (hata mesaji gosterildi). */
+static int hedef_coz(const char *host, struct in_addr *out) {
+    if (inet_pton(AF_INET, host, out) == 1) return 1;          /* zaten IP, DNS gerekmez */
+    if (!ayar.dns) { motor_hata("Target is a hostname but Resolve DNS is OFF (see Settings)."); return 0; }
+
+    int s = dns_ac();
+    if (s < 0) { motor_hata("No usable nameserver in /etc/resolv.conf."); return 0; }
+    uint16_t id;
+    if (!dns_sor(s, host, T_A, &id)) { close(s); motor_hata("Could not send the DNS query."); return 0; }
+
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    const char *hata = NULL; int sonuc = 0;
+    nodelay(stdscr, TRUE);
+    while (1) {
+        int k = getch();
+        if (k == 27 || k == 'q' || k == 'Q') break;            /* kullanici vazgecti, mesaj yok */
+
+        erase();
+        mvprintw(2, 4, "Resolving %s ...", host);
+        mvprintw(4, 4, "[ ESC ] cancel");
+        refresh();
+
+        fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
+        struct timeval tv = { 0, 60000 };                      /* 60 ms tick, ayni ritim */
+        if (select(s + 1, &rf, NULL, NULL, &tv) > 0) {
+            unsigned char buf[1500];
+            int n = recv(s, buf, sizeof(buf), 0);
+            if (n >= 2 && ((buf[0] << 8) | buf[1]) == id) {    /* benim sorgumun cevabi */
+                char ip[INET_ADDRSTRLEN];
+                if (dns_coz(buf, n, T_A, ip, sizeof(ip)) && inet_pton(AF_INET, ip, out) == 1) sonuc = 1;
+                else hata = "Host not found (no A record).";
+                break;
+            }
+        }
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        if (ms_fark(t0, now) > DNS_TIMEOUT_MS) { hata = "DNS timeout, the resolver did not answer."; break; }
+    }
+    nodelay(stdscr, FALSE);
+    close(s);
+    if (hata) motor_hata(hata);
+    return sonuc;
+}
+
+/* Ust satirdaki hedef yazisi: "8.8.8.8" ya da "dns.google -> 8.8.8.8" */
+static void hedef_yazisi(const char *host, struct in_addr ip, char *out, int cap) {
+    char ipbuf[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &ip, ipbuf, sizeof(ipbuf));
+    if (strcmp(host, ipbuf) == 0) snprintf(out, cap, "%s", ipbuf);
+    else                          snprintf(out, cap, "%s -> %s", host, ipbuf);
+}
+
+/* Hop basina PTR isi: 0 sorulmadi, 1 bekliyor, 2 bitti (bulundu ya da vazgecildi) */
+typedef struct {
+    int             durum;
+    uint16_t        id;
+    struct timespec t;
+    char            ip[INET_ADDRSTRLEN];   /* hangi IP icin soruldu, hop IP'si degisirse yeniden */
+} PtrIs;
+
+/* Her tick: IP'si yeni belli olan hop'lara PTR at, gelen cevaplari ID ile
+ * hop'lara dagit, 2 sn'de cevapsiz kalanlardan vazgec. Hic bloklamaz. */
+static void ptr_tick(int s, HopResult *hops, int count, PtrIs *p) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    for (int i = 0; i < count; i++) {
+        if (hops[i].ip[0] == '\0') continue;
+        if (p[i].durum != 0 && strcmp(p[i].ip, hops[i].ip) != 0) {   /* ECMP: hop IP'si degisti */
+            p[i].durum = 0; hops[i].name[0] = '\0';
+        }
+        if (p[i].durum == 0) {
+            struct in_addr a; char q[64];
+            inet_pton(AF_INET, hops[i].ip, &a); ptr_isim(a, q, sizeof(q));
+            if (dns_sor(s, q, T_PTR, &p[i].id)) { p[i].durum = 1; p[i].t = now; }
+            else p[i].durum = 2;
+            snprintf(p[i].ip, sizeof(p[i].ip), "%s", hops[i].ip);
+        } else if (p[i].durum == 1 && ms_fark(p[i].t, now) > DNS_TIMEOUT_MS) {
+            p[i].durum = 2;                                          /* cevap yok, isimsiz kalsin */
+        }
+    }
+
+    unsigned char buf[1500]; int n;
+    while ((n = recv(s, buf, sizeof(buf), MSG_DONTWAIT)) > 0) {      /* birikenleri bosalt, beklemeden */
+        if (n < 2) continue;
+        uint16_t id = (buf[0] << 8) | buf[1];
+        for (int i = 0; i < count; i++) {
+            if (p[i].durum != 1 || p[i].id != id) continue;
+            char name[256];
+            if (dns_coz(buf, n, T_PTR, name, sizeof(name)) && strcmp(name, p[i].ip) != 0)
+                snprintf(hops[i].name, sizeof(hops[i].name), "%.*s",       /* isim = IP ise gosterme (WSL) */
+                         (int)sizeof(hops[i].name) - 1, name);              /* uzun isim bilerek kirpilir */
+            p[i].durum = 2;
+            break;
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════
  *  TRACK SIGNAL — GERCEK FSM
  *
  *  Bloklamayan tick dongusu. Her turda: klavyeyi yokla,
@@ -1060,11 +1364,17 @@ static void motor_hata(const char *msg) {
 enum { ST_SEND, ST_WAIT, ST_DONE };
 
 void track_signal(void) {
-    /* Hedefi + protokolu config'den al, soketleri ac */
+    /* Hedefi coz (hostname ise DNS), protokolu config'den al, soketleri ac */
+    struct in_addr hedef_ip;
+    if (!hedef_coz(current_cfg.ip, &hedef_ip)) return;
     Motor m;
-    const char *hata = motor_ac(&m);
+    const char *hata = motor_ac(&m, hedef_ip);
     if (hata) { motor_kapat(&m); motor_hata(hata); return; }   /* raw socket root ister */
     char etiket[16]; motor_etiket(&m, etiket, sizeof(etiket));
+    char hedef_y[96]; hedef_yazisi(current_cfg.ip, hedef_ip, hedef_y, sizeof(hedef_y));
+
+    int dsock = ayar.dns ? dns_ac() : -1;      /* hop isimleri icin, acilamazsa isimsiz devam */
+    PtrIs ptr[MAX_HOPS]; memset(ptr, 0, sizeof(ptr));
 
     int limit = current_cfg.ttl;               /* config'deki TTL = max hop */
     if (limit > MAX_HOPS) limit = MAX_HOPS;
@@ -1099,6 +1409,7 @@ void track_signal(void) {
                 hops[ttl-1].ip[0] = '\0';
                 hops[ttl-1].reached = 0;
                 hops[ttl-1].flag = 0;
+                hops[ttl-1].name[0] = '\0';
                 count = ttl;
             }
             seq = ttl * probes + probe;         /* probe basina benzersiz */
@@ -1142,10 +1453,14 @@ void track_signal(void) {
             napms(30);                          /* bosa donmesin */
         }
 
+        /* ── 2b. DNS: yeni IP'lere PTR, gelen isimler ── */
+        if (dsock >= 0) ptr_tick(dsock, hops, count, ptr);   /* DONE'dan sonra da isimler dolmaya devam eder */
+
         /* ── 3. Ciz ─────────────────────────────────── */
-        draw_track(hops, count, running, etiket, probes, &scroll_off, &takip);
+        draw_track(hops, count, running, etiket, probes, &scroll_off, &takip, dsock >= 0, hedef_y);
     }
 
+    if (dsock >= 0) close(dsock);
     motor_kapat(&m);
     nodelay(stdscr, FALSE);                     /* menuye normal bloklayan getch ile don */
 }
@@ -1153,7 +1468,7 @@ void track_signal(void) {
 /* ═══════════════════════════════════════════════════
  *  SEND SIGNAL — PING TABLOSU CIZIMI
  * ═══════════════════════════════════════════════════ */
-static void draw_ping(const char *hedef_ip, const char *etiket, PingSat *ring, int ring_count,
+static void draw_ping(const char *hedef_ip, const char *hedef_y, const char *etiket, PingSat *ring, int ring_count,
                       int sent, int recv, double rmin, double rmax, double rsum,
                       int running) {
     erase();
@@ -1172,6 +1487,7 @@ static void draw_ping(const char *hedef_ip, const char *etiket, PingSat *ring, i
 
     /* ust cerceve + baslik */
     draw_hline(y, x, w, ACS_ULCORNER, ACS_URCORNER, -1, 0);
+    mvprintw(y - 1, x, "Target: %s", hedef_y);
     mvprintw(y, x + 2, "[ SEND SIGNAL ]");
     const char *st = running ? "[ RUNNING ]" : "[ DONE ]";
     mvprintw(y, x + w - (int)strlen(st) - 2, "%s", st);
@@ -1218,10 +1534,14 @@ static void draw_ping(const char *hedef_ip, const char *etiket, PingSat *ring, i
 
 /* ─── Send Signal ekrani (ping, ESC'e kadar surer) ─── */
 void send_signal(void) {
+    struct in_addr hedef_ip;
+    if (!hedef_coz(current_cfg.ip, &hedef_ip)) return;
     Motor m;
-    const char *hata = motor_ac(&m);
+    const char *hata = motor_ac(&m, hedef_ip);
     if (hata) { motor_kapat(&m); motor_hata(hata); return; }
     char etiket[16]; motor_etiket(&m, etiket, sizeof(etiket));
+    char hedef_y[96]; hedef_yazisi(current_cfg.ip, hedef_ip, hedef_y, sizeof(hedef_y));
+    char ipbuf[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &hedef_ip, ipbuf, sizeof(ipbuf));
 
     PingSat ring[PING_RING]; int ring_count = 0;
     int sent = 0, recv = 0, seq = 1;
@@ -1270,7 +1590,7 @@ void send_signal(void) {
             if (gecen >= PING_INTERVAL_MS) { seq++; state = ST_SEND; }  /* sonraki ping */
         }
 
-        draw_ping(current_cfg.ip, etiket, ring, ring_count, sent, recv, rmin, rmax, rsum, 1);
+        draw_ping(ipbuf, hedef_y, etiket, ring, ring_count, sent, recv, rmin, rmax, rsum, 1);
     }
 
     motor_kapat(&m);
