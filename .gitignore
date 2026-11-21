@@ -2,6 +2,7 @@
 signal_commander
 trace
 tcptrace
+udptrace
 *.o
 *.out
 a.out

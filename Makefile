@@ -1,6 +1,6 @@
 CC     := gcc
 CFLAGS := -Wall -Wextra -O2
-BINS   := signal_commander trace tcptrace
+BINS   := signal_commander trace tcptrace udptrace
 
 .PHONY: all clean setcap
 
@@ -15,10 +15,14 @@ trace: trace.c
 tcptrace: tcptrace.c
 	$(CC) $(CFLAGS) $< -o $@
 
+udptrace: udptrace.c
+	$(CC) $(CFLAGS) $< -o $@
+
 setcap: $(BINS)
 	sudo setcap cap_net_raw+ep ./signal_commander
 	sudo setcap cap_net_raw+ep ./trace
 	sudo setcap cap_net_raw+ep ./tcptrace
+	sudo setcap cap_net_raw+ep ./udptrace
 
 clean:
 	rm -f $(BINS)
