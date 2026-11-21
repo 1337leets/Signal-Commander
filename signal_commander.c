@@ -21,8 +21,7 @@
 #include <stdint.h>           /* uint16_t, uint32_t */
 
 #define MAX_HOPS    30
-#define PROBES      3
-#define TIMEOUT_SEC 2
+#define MAX_PROBES  5            /* HopResult dizisinin boyutu, Settings bunun altinda kalir */
 
 #define PING_TTL          64     /* ping'de TTL sabit-buyuk, hedefe ulassin */
 #define PING_RING         16     /* ekranda tutulan son ping satiri sayisi */
@@ -40,11 +39,19 @@ typedef struct {
 
 static Config current_cfg = {"127.0.0.1", 80, 64, "ICMP"};
 
-/* Bir hop: PROBES kadar probe'un sonucu tek satirda */
+/* Runtime ayarlar, Settings ekrani duzenler. Eskiden #define'di */
+typedef struct {
+    int probes;                  /* hop basina probe, 1..MAX_PROBES */
+    int timeout_ms;              /* track'te probe basina cevap penceresi */
+} Ayar;
+
+static Ayar ayar = { 3, 2000 };
+
+/* Bir hop: ayar.probes kadar probe'un sonucu tek satirda */
 typedef struct {
     int    hop;
     char   ip[INET_ADDRSTRLEN];  /* bos ise hicbir probe cevap vermedi -> * * * */
-    double rtt[PROBES];          /* -1 = o probe timeout */
+    double rtt[MAX_PROBES];      /* -1 = o probe timeout */
     int    reached;              /* 1 = hedefin kendisi cevapladi */
     char   flag;                 /* TCP/UDP: 'O' acik, 'C' kapali, 'U' ulasilamaz. 0 = duz hop */
 } HopResult;
@@ -61,7 +68,7 @@ typedef struct {
  *  FIELD METADATA
  *
  *  FLD_IP    : "x.x.x.x" formatı, her octet 0-255
- *  FLD_INT   : tam sayı, max_val'a kadar
+ *  FLD_INT   : tam sayı, min_val..max_val
  *  FLD_STR   : printable ASCII serbest metin
  *  FLD_CYCLE : önceden tanımlı seçenekler arasında ←/→ ile gezinme
  * ═══════════════════════════════════════════════════ */
@@ -71,6 +78,7 @@ typedef struct {
     const char  *label;
     FldType      type;
     int          maxlen;        /* string buffer boyutu (FLD_STR/IP için) */
+    int          min_val;       /* FLD_INT alt sınırı */
     int          max_val;       /* FLD_INT üst sınırı */
     const char **options;       /* FLD_CYCLE seçenekleri */
     int          opt_count;
@@ -81,14 +89,50 @@ static const char *PROTO_OPTS[] = { "ICMP", "TCP", "UDP" };
 #define CFG_FIELDS 4
 
 static const FldMeta FIELDS[CFG_FIELDS] = {
-    { "Target Host", FLD_IP,    15,     0, NULL,       0 },
-    { "Port",        FLD_INT,    5, 65535, NULL,       0 },
-    { "TTL",         FLD_INT,    3,   255, NULL,       0 },
-    { "Protocol",    FLD_CYCLE,  0,     0, PROTO_OPTS, 3 },
+    { "Target Host", FLD_IP,    15, 0,     0, NULL,       0 },
+    { "Port",        FLD_INT,    5, 0, 65535, NULL,       0 },
+    { "TTL",         FLD_INT,    3, 0,   255, NULL,       0 },
+    { "Protocol",    FLD_CYCLE,  0, 0,     0, PROTO_OPTS, 3 },
 };
 
+#define AYAR_FIELDS 2
+
+static const FldMeta AYAR_META[AYAR_FIELDS] = {
+    { "Probes per hop",   FLD_INT, 1,   1, MAX_PROBES, NULL, 0 },
+    { "Hop timeout (ms)", FLD_INT, 5, 100,      10000, NULL, 0 },
+};
+
+/* Bir formun tarifi: baslik, alan tablosu, veri <-> string cevirileri.
+ * Configuration ve Settings ayni motoru kullanir, yeni form = yeni tarif. */
+typedef struct {
+    const char    *title;
+    const FldMeta *fields;
+    int            count;
+    void         (*to_str)(const void *d, int idx, char *out, int outlen);
+    void         (*from_str)(void *d, int idx, const char *s);
+} FormDef;
+
+/* Ayar struct <-> string dönüşümleri */
+static void ayar_to_str(const void *d, int idx, char *out, int outlen) {
+    const Ayar *a = d;
+    switch (idx) {
+        case 0: snprintf(out, outlen, "%d", a->probes);     break;
+        case 1: snprintf(out, outlen, "%d", a->timeout_ms); break;
+    }
+}
+
+static void str_to_ayar(void *d, int idx, const char *s) {
+    Ayar *a = d;
+    if (!s || s[0] == '\0') return;
+    switch (idx) {
+        case 0: a->probes     = atoi(s); break;
+        case 1: a->timeout_ms = atoi(s); break;
+    }
+}
+
 /* Config struct <-> string dönüşümleri */
-static void field_to_str(const Config *c, int idx, char *out, int outlen) {
+static void field_to_str(const void *d, int idx, char *out, int outlen) {
+    const Config *c = d;
     switch (idx) {
         case 0: snprintf(out, outlen, "%s", c->ip);    break;
         case 1: snprintf(out, outlen, "%d", c->port);  break;
@@ -97,7 +141,8 @@ static void field_to_str(const Config *c, int idx, char *out, int outlen) {
     }
 }
 
-static void str_to_field(Config *c, int idx, const char *s) {
+static void str_to_field(void *d, int idx, const char *s) {
+    Config *c = d;
     if (!s || s[0] == '\0') return;
     switch (idx) {
         case 0: snprintf(c->ip,    sizeof(c->ip),    "%s", s); break;
@@ -106,6 +151,11 @@ static void str_to_field(Config *c, int idx, const char *s) {
         case 3: snprintf(c->proto, sizeof(c->proto), "%s", s); break;
     }
 }
+
+static const FormDef CFG_FORM  = { "[ CONFIGURATION ]", FIELDS,    CFG_FIELDS,
+                                   field_to_str, str_to_field };
+static const FormDef AYAR_FORM = { "[ SETTINGS ]",      AYAR_META, AYAR_FIELDS,
+                                   ayar_to_str,  str_to_ayar };
 
 /* ═══════════════════════════════════════════════════
  *  LAYOUT
@@ -148,7 +198,7 @@ static int g_l_w   = 20;
  * genisligi terminale sigdir. Min 40, max 60 kolon
  * genisliginde tutar; dikeyde de ortalar.
  */
-static void recompute_layout(void) {
+static void recompute_layout(int nfields) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
 
@@ -157,7 +207,7 @@ static void recompute_layout(void) {
     if (g_box_w > 60) g_box_w = 60;
     if (g_box_w < 40) g_box_w = 40;
 
-    g_box_h = 10;
+    g_box_h = nfields + 6;     /* ust, baslik, ayirac, alanlar, ayirac, butonlar, alt */
 
     /* Yatayda ortala */
     g_box_x = (cols - g_box_w) / 2;
@@ -184,7 +234,7 @@ static void draw_hline(int y, int x, int w,
     mvaddch(y, x + w - 1, right);
 }
 
-static void draw_box_frame(void) {
+static void draw_box_frame(int nfields) {
     draw_hline(BOX_Y, BOX_X, BOX_W,
                ACS_ULCORNER, ACS_URCORNER, SEP_X, ACS_TTEE);
 
@@ -193,14 +243,14 @@ static void draw_box_frame(void) {
         mvaddch(row, BOX_X,             ACS_VLINE);
         mvaddch(row, BOX_X + BOX_W - 1, ACS_VLINE);
         int is_header = (row == HEADER_ROW);
-        int is_field  = (row >= FIRST_ROW && row < FIRST_ROW + CFG_FIELDS);
+        int is_field  = (row >= FIRST_ROW && row < FIRST_ROW + nfields);
         if (is_header || is_field)
             mvaddch(row, SEP_X, ACS_VLINE);
     }
 
     draw_hline(HEADER_ROW + 1, BOX_X, BOX_W,
                ACS_LTEE, ACS_RTEE, SEP_X, ACS_PLUS);
-    draw_hline(FIRST_ROW + CFG_FIELDS, BOX_X, BOX_W,
+    draw_hline(FIRST_ROW + nfields, BOX_X, BOX_W,
                ACS_LTEE, ACS_RTEE, SEP_X, ACS_BTEE);
     draw_hline(BOX_Y + BOX_H - 1, BOX_X, BOX_W,
                ACS_LLCORNER, ACS_LRCORNER, -1, 0);
@@ -262,12 +312,12 @@ static int validate_ipv4(const char *s) {
  * ═══════════════════════════════════════════════════ */
 typedef enum { MODE_NAV, MODE_EDIT } CfgMode;
 
-static void draw_config(const Config *tmp, int sel, CfgMode mode) {
-    recompute_layout();
+static void draw_form(const FormDef *f, const void *tmp, int sel, CfgMode mode) {
+    recompute_layout(f->count);
     erase();
-    draw_box_frame();
+    draw_box_frame(f->count);
 
-    mvprintw(BOX_Y, BOX_X + 2, "[ CONFIGURATION ]");
+    mvprintw(BOX_Y, BOX_X + 2, "%s", f->title);
     const char *mode_str = (mode == MODE_NAV) ? "[ NAV MODE ]" : "[ EDIT MODE ]";
     mvprintw(BOX_Y, BOX_X + BOX_W - (int)strlen(mode_str) - 2, "%s", mode_str);
 
@@ -277,11 +327,11 @@ static void draw_config(const Config *tmp, int sel, CfgMode mode) {
     attroff(A_BOLD);
 
     char valbuf[64];
-    for (int i = 0; i < CFG_FIELDS; i++) {
+    for (int i = 0; i < f->count; i++) {
         int row    = FIRST_ROW + i;
         int is_sel = (sel == i);
 
-        field_to_str(tmp, i, valbuf, sizeof(valbuf));
+        f->to_str(tmp, i, valbuf, sizeof(valbuf));
 
         /* Label hucresi */
         int lattr = 0;
@@ -289,14 +339,14 @@ static void draw_config(const Config *tmp, int sel, CfgMode mode) {
             lattr = (mode == MODE_NAV) ? A_REVERSE : A_BOLD;
 
         if (lattr) attron(lattr);
-        mvprintw(row, L_X, " %-*s ", L_W - 3, FIELDS[i].label);
+        mvprintw(row, L_X, " %-*s ", L_W - 3, f->fields[i].label);
         if (lattr) attroff(lattr);
 
         /* Value hucresi:
          * EDIT modunda + secili + text field ise underscore'lu giris alani goster.
          * Diger durumlarda mevcut degeri yaz (gerekiyorsa highlight ile). */
-        if (is_sel && mode == MODE_EDIT && FIELDS[i].type != FLD_CYCLE) {
-            int ml = FIELDS[i].maxlen;
+        if (is_sel && mode == MODE_EDIT && f->fields[i].type != FLD_CYCLE) {
+            int ml = f->fields[i].maxlen;
             mvaddch(row, R_X, ' ');
             for (int j = 0; j < ml; j++)
                 mvaddch(row, R_X + 1 + j, ' ' | A_UNDERLINE);
@@ -313,8 +363,8 @@ static void draw_config(const Config *tmp, int sel, CfgMode mode) {
         }
     }
 
-    int save_sel   = (sel == CFG_FIELDS);
-    int cancel_sel = (sel == CFG_FIELDS + 1);
+    int save_sel   = (sel == f->count);
+    int cancel_sel = (sel == f->count + 1);
 
     /* Butonlari kutu yarilarinin ortasina yerlestir
      * (BOX_W degisirse yine ortali kalsin diye dinamik) */
@@ -335,11 +385,11 @@ static void draw_config(const Config *tmp, int sel, CfgMode mode) {
     /* Footer */
     const char *hint;
     if (mode == MODE_NAV) {
-        if (sel >= CFG_FIELDS)
+        if (sel >= f->count)
             hint = "  LEFT/RIGHT swap   ENTER select   UP back to fields";
         else
             hint = "  UP/DOWN navigate   ENTER edit/select   q quit";
-    } else if (sel < CFG_FIELDS && FIELDS[sel].type == FLD_CYCLE)
+    } else if (sel < f->count && f->fields[sel].type == FLD_CYCLE)
         hint = "  LEFT/RIGHT cycle   ENTER commit   ESC abort";
     else
         hint = "  type value   ENTER commit   ESC abort";
@@ -376,10 +426,10 @@ static int read_text(int y, int x, const FldMeta *meta, char *buf) {
 
             if (meta->type == FLD_INT && len > 0) {
                 long v = atol(buf);
-                if (v < 0 || v > meta->max_val) {
+                if (v < meta->min_val || v > meta->max_val) {
                     char msg[64];
                     snprintf(msg, sizeof(msg),
-                             "Value out of range (0-%d)", meta->max_val);
+                             "Value out of range (%d-%d)", meta->min_val, meta->max_val);
                     show_error(msg);
                     continue;
                 }
@@ -493,56 +543,58 @@ static int read_cycle(int y, int x, const FldMeta *meta,
     }
 }
 
-/* ─── Config ekrani ana dongusu ─────────────────────── */
-void open_configuration(void) {
-    Config tmp = current_cfg;
+/* ─── Form ana dongusu (Configuration + Settings) ────────
+ * live = gercek veri, tmp = ayni tipte calisma kopyasi.
+ * SAVE'de tmp live'a kopyalanir, CANCEL / q'da atilir. */
+static void open_form(const FormDef *f, void *live, void *tmp, size_t size) {
+    memcpy(tmp, live, size);
     int sel    = 0;
     CfgMode mode = MODE_NAV;
 
     /*
-     * Navigasyon modeli:
-     *   sel 0..3   : field'lar (dikey grup)
-     *   sel 4      : SAVE buton
-     *   sel 5      : CANCEL buton
+     * Navigasyon modeli (n = f->count):
+     *   sel 0..n-1 : field'lar (dikey grup)
+     *   sel n      : SAVE buton
+     *   sel n+1    : CANCEL buton
      *
      *   Field icinde:  UP/DOWN field'lar arasi
-     *   Field 3 + DOWN -> butonlara gec (SAVE)
+     *   Son field + DOWN -> butonlara gec (SAVE)
      *   Field 0 + UP   -> butonlara cik (SAVE)
      *   Buton + UP     -> son field'a don
      *   Buton + DOWN   -> ilk field'a wrap
      *   Buton + LEFT/RIGHT -> butonlar arasi swap
      */
     while (1) {
-        draw_config(&tmp, sel, mode);
+        draw_form(f, tmp, sel, mode);
         int key = getch();
 
         switch (key) {
         case KEY_UP:
-            if (sel >= CFG_FIELDS)
-                sel = CFG_FIELDS - 1;          /* buton -> son field */
+            if (sel >= f->count)
+                sel = f->count - 1;          /* buton -> son field */
             else
-                sel = (sel > 0) ? sel - 1 : CFG_FIELDS;  /* 0 -> Save */
+                sel = (sel > 0) ? sel - 1 : f->count;  /* 0 -> Save */
             clear_status();
             break;
         case KEY_DOWN:
-            if (sel < CFG_FIELDS)
-                sel = (sel < CFG_FIELDS - 1) ? sel + 1 : CFG_FIELDS;
+            if (sel < f->count)
+                sel = (sel < f->count - 1) ? sel + 1 : f->count;
             else
                 sel = 0;                       /* buton -> ilk field */
             clear_status();
             break;
         case KEY_LEFT:
         case KEY_RIGHT:
-            if (sel >= CFG_FIELDS)
-                sel = (sel == CFG_FIELDS) ? CFG_FIELDS + 1 : CFG_FIELDS;
+            if (sel >= f->count)
+                sel = (sel == f->count) ? f->count + 1 : f->count;
             clear_status();
             break;
         case '\n':
         case KEY_ENTER:
-            if (sel < CFG_FIELDS) {
-                const FldMeta *meta = &FIELDS[sel];
+            if (sel < f->count) {
+                const FldMeta *meta = &f->fields[sel];
                 mode = MODE_EDIT;
-                draw_config(&tmp, sel, mode);
+                draw_form(f, tmp, sel, mode);
 
                 char buf[64] = {0};
                 int  row = FIRST_ROW + sel;
@@ -550,18 +602,18 @@ void open_configuration(void) {
 
                 if (meta->type == FLD_CYCLE) {
                     char init[8];
-                    field_to_str(&tmp, sel, init, sizeof(init));
+                    f->to_str(tmp, sel, init, sizeof(init));
                     ok = read_cycle(row, R_X + 1, meta, init, buf);
                 } else {
                     ok = read_text(row, R_X + 1, meta, buf);
                 }
 
                 if (ok && buf[0] != '\0')
-                    str_to_field(&tmp, sel, buf);
+                    f->from_str(tmp, sel, buf);
 
                 mode = MODE_NAV;
-            } else if (sel == CFG_FIELDS) {
-                current_cfg = tmp;
+            } else if (sel == f->count) {
+                memcpy(live, tmp, size);
                 return;
             } else {
                 return;
@@ -572,6 +624,16 @@ void open_configuration(void) {
             return;
         }
     }
+}
+
+void open_configuration(void) {
+    Config tmp;
+    open_form(&CFG_FORM, &current_cfg, &tmp, sizeof(tmp));
+}
+
+void open_settings(void) {
+    Ayar tmp;
+    open_form(&AYAR_FORM, &ayar, &tmp, sizeof(tmp));
 }
 
 /* ═══════════════════════════════════════════════════
@@ -585,12 +647,13 @@ static const char *flag_yazi(char f) {
     return "";
 }
 
-static void draw_track(HopResult *hops, int count, int running, const char *etiket) {
+static void draw_track(HopResult *hops, int count, int running, const char *etiket, int probes) {
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
 
-    int w = 62; if (w > cols - 4) w = cols - 4;   /* IP + 3 RTT kolonu sigsin diye genis */
+    int flag_x = 24 + probes * 10;                 /* RTT kolonlarindan sonra karar kolonu */
+    int w = flag_x + 8; if (w > cols - 4) w = cols - 4;   /* 3 probe'da 62, eskisiyle ayni */
     int x = (cols - w) / 2; if (x < 2) x = 2;
     int y = 2;
 
@@ -612,7 +675,7 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
     attron(A_BOLD);
     mvprintw(y + 1, x + 2,  "HOP");
     mvprintw(y + 1, x + 7,  "IP ADDRESS");
-    for (int p = 0; p < PROBES; p++) {              /* baslik da deger de sag hizali, alt alta gelsin */
+    for (int p = 0; p < probes; p++) {              /* baslik da deger de sag hizali, alt alta gelsin */
         char lbl[8]; snprintf(lbl, sizeof(lbl), "RTT %d", p + 1);
         mvprintw(y + 1, x + 24 + p * 10, "%6s", lbl);
     }
@@ -630,13 +693,13 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
             mvprintw(ry, x + 2, "%2d   * * *", h->hop);
         } else {
             mvprintw(ry, x + 2, "%2d   %-15s", h->hop, h->ip);
-            for (int p = 0; p < PROBES; p++) {          /* her probe kendi kolonuna, sag hizali */
+            for (int p = 0; p < probes; p++) {          /* her probe kendi kolonuna, sag hizali */
                 int cx = x + 24 + p * 10;
                 (h->rtt[p] < 0) ? mvprintw(ry, cx, "%6s", "*")
                                 : mvprintw(ry, cx, "%6.2f ms", h->rtt[p]);
             }
-            if (h->flag && x + 54 + 6 < x + w - 1)     /* TCP karari, cerceveye tasmasin */
-                mvprintw(ry, x + 54, "%s", flag_yazi(h->flag));
+            if (h->flag && flag_x + 6 < w - 1)          /* TCP/UDP karari, cerceveye tasmasin */
+                mvprintw(ry, x + flag_x, "%s", flag_yazi(h->flag));
         }
     }
 
@@ -781,7 +844,7 @@ static struct timespec tcp_probe_gonder(Motor *m, int ttl, uint32_t seq) {
  *  portta: port = blok basi + tag % UDP_BLOK. Bedeli:
  *  5-tuple probe'dan probe'a degisir, ECMP yolu oynayabilir.
  * ═══════════════════════════════════════════════════ */
-#define UDP_BLOK 100                   /* oturum basina port, track en fazla 92 etiket kullanir */
+#define UDP_BLOK 200                   /* oturum basina port, track en fazla 30*5+4 = 154 etiket kullanir */
 
 static uint16_t udp_port(const Motor *m, int tag) {
     return m->sport + (uint16_t)(tag % UDP_BLOK);
@@ -945,7 +1008,7 @@ static const char *motor_ac(Motor *m) {
     if (m->proto == IPPROTO_UDP) {
         if (current_cfg.port < 1) return "UDP needs a port between 1 and 65535.";
         m->hedef.sin_port = htons(current_cfg.port);
-        m->sport = 40000 + ((getpid() + oturum++) % 200) * UDP_BLOK;  /* oturum basina ayri blok */
+        m->sport = 40000 + ((getpid() + oturum++) % 100) * UDP_BLOK;  /* oturum basina ayri blok, en fazla 59999 */
     }
     return NULL;
 }
@@ -982,7 +1045,7 @@ static void motor_hata(const char *msg) {
  *           cevap geldi YA DA timeout -> ilerle
  *    DONE : hedefe varildi ya da ttl limiti doldu; tablo dursun
  *
- *  ilerle: probe++ ; 3 dolunca hop++ (ya da DONE)
+ *  ilerle: probe++ ; ayar.probes dolunca hop++ (ya da DONE)
  * ═══════════════════════════════════════════════════ */
 enum { ST_SEND, ST_WAIT, ST_DONE };
 
@@ -996,6 +1059,11 @@ void track_signal(void) {
     int limit = current_cfg.ttl;               /* config'deki TTL = max hop */
     if (limit > MAX_HOPS) limit = MAX_HOPS;
     if (limit < 1) limit = 1;
+
+    int probes = ayar.probes;                  /* oturum basinda dondur, yarida degismesin */
+    if (probes < 1) probes = 1;
+    if (probes > MAX_PROBES) probes = MAX_PROBES;
+    double timeout_ms = ayar.timeout_ms;
 
     HopResult hops[MAX_HOPS]; memset(hops, 0, sizeof(hops));
 
@@ -1014,13 +1082,13 @@ void track_signal(void) {
         if (state == ST_SEND) {
             if (probe == 0) {                  /* yeni hop: satiri sifirla */
                 hops[ttl-1].hop = ttl;
-                for (int p = 0; p < PROBES; p++) hops[ttl-1].rtt[p] = -1.0;
+                for (int p = 0; p < MAX_PROBES; p++) hops[ttl-1].rtt[p] = -1.0;
                 hops[ttl-1].ip[0] = '\0';
                 hops[ttl-1].reached = 0;
                 hops[ttl-1].flag = 0;
                 count = ttl;
             }
-            seq = ttl * PROBES + probe;         /* probe basina benzersiz */
+            seq = ttl * probes + probe;         /* probe basina benzersiz */
             sent_at = probe_at(&m, ttl, seq);
             state = ST_WAIT;
         }
@@ -1042,12 +1110,12 @@ void track_signal(void) {
                 struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
                 double gecen = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
                                (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
-                if (gecen >= TIMEOUT_SEC * 1000.0) bitti = 1;   /* rtt -1 kalir */
+                if (gecen >= timeout_ms) bitti = 1;             /* rtt -1 kalir */
             }
 
             if (bitti) {                        /* ilerle: sonraki probe ya da sonraki hop */
                 probe++;
-                if (probe >= PROBES) {
+                if (probe >= probes) {
                     probe = 0;
                     if (hops[ttl-1].reached || ttl >= limit) state = ST_DONE;
                     else { ttl++; state = ST_SEND; }
@@ -1062,7 +1130,7 @@ void track_signal(void) {
         }
 
         /* ── 3. Ciz ─────────────────────────────────── */
-        draw_track(hops, count, running, etiket);
+        draw_track(hops, count, running, etiket, probes);
     }
 
     motor_kapat(&m);
@@ -1275,6 +1343,7 @@ int main(void) {
             if (highlight == 0)         send_signal();
             else if (highlight == 1)    track_signal();
             else if (highlight == 2)    open_configuration();
+            else if (highlight == 3)    open_settings();
             else if (highlight == 4)    goto quit;
             break;
         }
