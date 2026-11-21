@@ -67,6 +67,7 @@ Target: dns.google -> 8.8.8.8
 │  Probes per hop     │  3                                 │
 │  Hop timeout (ms)   │  2000                              │
 │  Parallel probes    │  16                                │
+│  UDP mode           │  Paris                             │
 │  Resolve DNS        │  ON                                │
 ├─────────────────────┴────────────────────────────────────┤
 │          [ SAVE ]                     [ CANCEL ]         │
@@ -78,14 +79,15 @@ Target: dns.google -> 8.8.8.8
 
 - **Track Signal.** Live traceroute over ICMP, TCP SYN or UDP. The table fills in as replies
   arrive, scrolls, follows new hops and marks the verdict (`open` or `closed`, or an unreachable
-  mark such as `!H`).
+  mark such as `!H`). A `+1` or `+2` right after an address means that many other routers
+  answered the same hop, the sign of a path split by load balancing.
 - **Send Signal.** Continuous ping over the same three protocols with a rolling result window
   and live min / avg / max and packet-loss statistics. Over TCP it measures SYN to SYN-ACK, which
   still works where ICMP is filtered.
 - **Configuration.** Target host (IPv4 or hostname), port, TTL and protocol, each checked when it
   is committed.
-- **Settings.** Probes per hop (1 to 5), hop timeout (100 to 10000 ms), parallel probes (1 to 32)
-  and a Resolve DNS switch.
+- **Settings.** Probes per hop (1 to 5), hop timeout (100 to 10000 ms), parallel probes (1 to 32),
+  UDP mode (Paris or Classic) and a Resolve DNS switch.
 - **DNS.** Hostname targets and a reverse name for every hop, from a hand-built DNS client that
   never blocks the UI.
 - **Standalone tools.** `trace`, `tcptrace`, `udptrace` and `dnsq` are the CLI testbeds each
@@ -118,7 +120,8 @@ make setcap
 - `./signal_commander` starts the TUI. Arrow keys navigate, Enter selects, and ESC or q backs out.
 - `./trace [ipv4]` runs an ICMP traceroute.
 - `./tcptrace [ipv4] [port]` runs a TCP SYN traceroute, port 443 by default.
-- `./udptrace [ipv4] [port]` runs a UDP traceroute, port 33434 by default.
+- `./udptrace [-p] [ipv4] [port]` runs a UDP traceroute, port 33434 by default. `-p` picks Paris
+  mode. It also lists every router that answered a hop and counts the hops that split.
 - `./dnsq <name> [server]` and `./dnsq -x <ipv4> [server]` run a forward or reverse lookup. This
   one needs no root.
 
@@ -138,9 +141,9 @@ The traceroute tools default to 8.8.8.8 when no address is given.
   timeout while the keyboard is polled separately, so the table updates live and ESC always
   responds.
 - **One tag per probe.** Each probe carries a unique tag (`ttl * probes + probe`). ICMP carries it
-  in the echo sequence number, TCP in the low 16 bits of the SYN sequence number and UDP in the
-  source port. A late reply can never be credited to the wrong probe, and the same tag lets a reply
-  find its slot when many probes are in flight.
+  in the echo sequence number, TCP in the low 16 bits of the SYN sequence number, Classic UDP in
+  the source port and Paris UDP in the IP ID. A late reply can never be credited to the wrong
+  probe, and the same tag lets a reply find its slot when many probes are in flight.
 - **Embedded-packet parsing.** A Time Exceeded reply carries the original probe's IP header plus
   the first 8 bytes of its payload. The parser digs through the outer IP header, the 8-byte ICMP
   header and the embedded IP header to recover the original ports and tag. Every step checks the
@@ -150,9 +153,25 @@ The traceroute tools default to 8.8.8.8 when no address is given.
   its route lookup, and `getsockname()` reads the chosen source back without a single packet
   leaving. The target answers with SYN-ACK (open) or RST (closed). The kernel then answers that
   SYN-ACK with its own RST, since it never opened the connection.
-- **UDP with kernel help.** UDP probes are ordinary datagrams with a chosen TTL and source port.
-  The whole UDP header fits in the 8 bytes a Time Exceeded message quotes, so the source port
-  carries the tag. An ICMP Port Unreachable from the target means the trace has arrived.
+- **Classic UDP.** Probes are ordinary datagrams with a chosen TTL and source port. The whole UDP
+  header fits in the 8 bytes a Time Exceeded message quotes, so the source port carries the tag.
+  An ICMP Port Unreachable from the target means the trace has arrived. The catch is that a new
+  source port means a new flow, and load balancers (ECMP) are free to send each flow down a
+  different path.
+- **Paris UDP.** The Paris traceroute idea is to keep every field a load balancer hashes on fixed
+  for the whole trace. Here both ports, the length and therefore the checksum never change, and
+  the IP and UDP headers are written by hand (`IP_HDRINCL`). The tag rides in the IP ID instead,
+  which load balancers do not hash and which comes back whole inside the quoted IP header.
+- **Why not the checksum.** The Paris paper hides the tag in the UDP checksum, solved through a
+  2-byte payload word. That was the first try here, and a capture showed why it failed behind
+  WSL2. The Windows NAT rewrites the checksum on the way out but never restores it inside the
+  quoted header on the way back, so every reply past hop 1 came back off by the same constant.
+  The IP ID came back untouched through all three NATs on the path.
+- **Strict aliasing.** The first Paris probes all went out with a wrong UDP checksum. The packet
+  was filled through struct pointers and read back through an `unsigned short` pointer, which
+  breaks C's strict aliasing rule, and gcc at `-O2` moved the loads ahead of the stores. The same
+  source built with `-fno-strict-aliasing` was correct. Every checksum now loads its words with
+  `memcpy`, which is alias-safe and still compiles to a single load.
 - **Parallel probing.** Track keeps a window of probes in flight (16 by default, the same as Linux
   traceroute). Each probe owns a slot, replies go straight to their slot by tag, and slots time out
   on their own. When a probe reaches the target the trace stops at that hop and drops the probes
@@ -182,6 +201,17 @@ Wall time until `[ DONE ]` for a trace to 8.8.8.8, 3 probes per hop, 2000 ms tim
 | TCP 443   | 43.8 s to 50.0 s  | 3.9 s to 4.0 s      |
 | UDP 33434 | not measured      | 2.0 s to 3.8 s      |
 
+Path splits with `udptrace` (one probe in flight), counting hops where more than one router
+answered within a single trace.
+
+| UDP mode | Traces | Reached the target | Split hops per trace |
+|----------|--------|--------------------|----------------------|
+| Classic  | 4      | 4                  | 1, 2, 1, 1           |
+| Paris    | 5      | 5                  | 0, 0, 0, 0, 0        |
+
+Paris keeps each trace on one path. A new trace gets a new source port, so it may take a
+different path than the previous one, and that is expected.
+
 These come from WSL2 on a single home connection, so they illustrate the effect rather than
 benchmark it.
 
@@ -191,8 +221,10 @@ benchmark it.
   so a burst shows more `*`, and RTTs can read higher in a burst than one probe at a time.
 - In parallel mode TCP changes the source port for every probe, so routers that balance traffic
   across several paths (ECMP) may send probes down different ones. Setting Parallel probes to 1
-  keeps a single TCP source port and therefore a single path, the idea behind Paris traceroute.
-  UDP always varies the source port, because that is where its tag lives.
+  keeps a single TCP source port and therefore a single path. Paris UDP keeps one path at any
+  window size.
+- Paris UDP relies on NATs leaving the quoted IP ID alone. If replies stop matching past some hop,
+  switching UDP mode to Classic is the fallback.
 - Some routers answer ICMP probes but stay silent for TCP or UDP ones, so the same path can show
   different gaps per protocol.
 - Under WSL2 the first hop is the Windows NAT gateway. The WSL DNS proxy also answers PTR lookups
@@ -221,11 +253,10 @@ closed, so it shows as `closed` instead.
 
 ## Status
 
-Traceroute and ping over ICMP, TCP and UDP, DNS, scrolling, parallel probing and per-code
-unreachable marks all work.
+Traceroute and ping over ICMP, TCP and UDP (Paris or Classic), DNS, scrolling, parallel probing,
+split markers and per-code unreachable marks all work.
 
-Not done yet are IPv6 and a Paris-style UDP mode (a fixed source port with the tag moved into the
-checksum field).
+Not done yet is IPv6.
 
 ## Requirements & notes
 

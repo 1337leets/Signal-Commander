@@ -46,11 +46,12 @@ typedef struct {
     int timeout_ms;              // Reply window per probe in Track
     int dns;                     // 1 = hostname targets + hop names (PTR)
     int window;                  // Probes in flight at once, 1 = one at a time (old behavior)
+    int udp_paris;               // 1 = Paris UDP (fixed 5-tuple, tag in the IP ID), 0 = classic
 } Settings;
 
 #define MAX_WINDOW 32
 
-static Settings settings = { 3, 2000, 0, 16 };   // 16 = Linux traceroute's default
+static Settings settings = { 3, 2000, 0, 16, 1 };   // 16 = Linux traceroute's default
 
 // One hop, settings.probes results folded into one row.
 typedef struct {
@@ -60,6 +61,7 @@ typedef struct {
     int    reached;              // 1 = the target itself answered
     char   flag;                 // 'O' open, 'C' closed, 'N' 'H' 'X' 'P' 'F' 'U' unreachable kinds. 0 = plain hop
     char   name[64];             // PTR name, empty when DNS is off or nothing came back
+    char   ips[MAX_PROBES][INET_ADDRSTRLEN];   // Responder per probe, shows when ECMP splits a hop
 } HopResult;
 
 // One ping result. ok=0 means timeout, or unreachable when flag is one of the unreachable kinds.
@@ -91,6 +93,7 @@ typedef struct {
 
 static const char *PROTO_OPTS[] = { "ICMP", "TCP", "UDP" };
 static const char *ONOFF_OPTS[] = { "OFF", "ON" };
+static const char *UDP_OPTS[]   = { "Paris", "Classic" };
 
 #define CFG_FIELDS 4
 
@@ -101,12 +104,13 @@ static const FldMeta FIELDS[CFG_FIELDS] = {
     { "Protocol",    FLD_CYCLE,  0, 0,     0, PROTO_OPTS, 3 },
 };
 
-#define SET_FIELDS 4
+#define SET_FIELDS 5
 
 static const FldMeta SET_META[SET_FIELDS] = {
     { "Probes per hop",   FLD_INT,   1,   1, MAX_PROBES,  NULL,       0 },
     { "Hop timeout (ms)", FLD_INT,   5, 100,      10000,  NULL,       0 },
     { "Parallel probes",  FLD_INT,   2,   1, MAX_WINDOW,  NULL,       0 },
+    { "UDP mode",         FLD_CYCLE, 0,   0,          0,  UDP_OPTS,   2 },
     { "Resolve DNS",      FLD_CYCLE, 0,   0,          0,  ONOFF_OPTS, 2 },
 };
 
@@ -127,7 +131,8 @@ static void settings_to_str(const void *d, int idx, char *out, int outlen) {
         case 0: snprintf(out, outlen, "%d", a->probes);     break;
         case 1: snprintf(out, outlen, "%d", a->timeout_ms); break;
         case 2: snprintf(out, outlen, "%d", a->window);     break;
-        case 3: snprintf(out, outlen, "%s", a->dns ? "ON" : "OFF"); break;
+        case 3: snprintf(out, outlen, "%s", a->udp_paris ? "Paris" : "Classic"); break;
+        case 4: snprintf(out, outlen, "%s", a->dns ? "ON" : "OFF"); break;
     }
 }
 
@@ -138,7 +143,8 @@ static void str_to_settings(void *d, int idx, const char *s) {
         case 0: a->probes     = atoi(s); break;
         case 1: a->timeout_ms = atoi(s); break;
         case 2: a->window     = atoi(s); break;
-        case 3: a->dns        = (strcmp(s, "ON") == 0); break;
+        case 3: a->udp_paris  = (strcmp(s, "Paris") == 0); break;
+        case 4: a->dns        = (strcmp(s, "ON") == 0); break;
     }
 }
 
@@ -735,6 +741,14 @@ static void draw_track(HopResult *hops, int count, int running, const char *labe
             mvprintw(ry, x + 2, "%2d   * * *", h->hop);
         } else {
             mvprintw(ry, x + 2, "%2d   %-15s", h->hop, h->ip);
+            int others = 0;                             // Routers other than the one shown, ECMP split this hop
+            for (int p = 0; p < probes; p++) {
+                if (!h->ips[p][0] || strcmp(h->ips[p], h->ip) == 0) continue;
+                int seen = 0;
+                for (int q = 0; q < p; q++) if (strcmp(h->ips[q], h->ips[p]) == 0) seen = 1;
+                if (!seen) others++;
+            }
+            if (others) mvprintw(ry, x + 22, "+%d", others);   // Fits the 2 columns before RTT 1
             for (int p = 0; p < probes; p++) {          // Each probe in its own right aligned column
                 int cx = x + 24 + p * 10;
                 (h->rtt[p] < 0) ? mvprintw(ry, cx, "%6s", "*")
@@ -814,17 +828,20 @@ struct pseudo_hdr {
 
 // One session's engine (Track or Send): protocol, sockets, identity.
 // ICMP only fills isock. TCP adds tsock, src and sport.
-// UDP uses sport as the start of a port block, every probe leaves from its own socket.
+// Classic UDP uses sport as the start of a port block, every probe leaves from its own socket.
+// Paris UDP keeps one sport and sends hand-built IP + UDP headers through usock.
 // TCP with port_block = 1 (parallel Track) also gives every SYN its own port from the block.
 typedef struct {
     int                proto;      // IPPROTO_ICMP, IPPROTO_TCP or IPPROTO_UDP
     struct sockaddr_in target;     // sin_port matters for TCP and UDP
     struct in_addr     src;        // Source IP for the pseudo-header
     unsigned short     my_id;      // pid, my signature
-    uint16_t           sport;      // TCP: fixed source port or block start. UDP: block start
+    uint16_t           sport;      // TCP: fixed port or block start. UDP: block start, or the one Paris port
     int                port_block; // TCP: 1 = port per probe, 0 = one fixed port (Paris)
+    int                paris;      // UDP: 1 = fixed 5-tuple, tag in the IP ID
     int                isock;      // Raw ICMP: echo reply, time exceeded, unreachable
     int                tsock;      // Raw TCP: sends SYNs, hears SYN-ACK and RST. -1 for ICMP
+    int                usock;      // Raw UDP with IP_HDRINCL for Paris sends, -1 otherwise
 } Engine;
 
 #define PORT_BLOCK 200                  // Ports per session, Track uses at most 30*5+4 = 154 tags
@@ -891,13 +908,14 @@ static struct timespec send_tcp_probe(Engine *m, int ttl, int tag) {
 }
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
-// UDP Engine (kernel sends) ___________________________________________________________________
-// Boxes from udptrace.c. The kernel builds the datagram, I only pick the TTL and source port.
-// Routers answer with Time Exceeded, the target with Port Unreachable, both read off the raw
-// ICMP socket.
-// Identity: the 8 quoted bytes are the whole UDP header. The destination port is fixed by the
-// config, so the tag lives in the source port: port = block start + tag % PORT_BLOCK. The price
-// is a 5-tuple that changes per probe, so the ECMP path may shift.
+// UDP Engine (Classic and Paris) ______________________________________________________________
+// Boxes from udptrace.c. Routers answer with Time Exceeded, the target with Port Unreachable,
+// both read off the raw ICMP socket.
+// Classic: the kernel builds the datagram, I only pick the TTL and source port. The 8 quoted bytes
+// are the whole UDP header and the destination port is fixed by the config, so the tag lives in
+// the source port: port = block start + tag % PORT_BLOCK. The price is a 5-tuple that changes per
+// probe, so the ECMP path may shift.
+// Paris: I write the IP and UDP headers, the 5-tuple never changes and the tag rides in the IP ID.
 
 static uint16_t udp_port(const Engine *m, int tag) {
     return m->sport + (uint16_t)(tag % PORT_BLOCK);
@@ -924,11 +942,51 @@ static struct timespec send_udp_probe(Engine *m, int ttl, int tag) {
     return t;
 }
 
-// Sends the right kind of probe for the protocol. tag = ICMP seq, low half of the TCP seq or
-// UDP port offset.
+// Paris IP ID for a tag. Never 0, a zero ID lets the kernel pick its own and the tag is lost.
+static uint16_t paris_id(int tag) {
+    return (uint16_t)(tag % 0xFFFF + 1);
+}
+
+// One Paris datagram, from udptrace.c. Ports, length and checksum never change, so every probe has
+// the same 5-tuple and ECMP keeps it on one path. The tag rides in the IP ID, which load balancers
+// do not hash and the Time Exceeded quote brings back whole. The UDP checksum was tried first and
+// dropped: measured, the Windows NAT rewrites it and never restores it inside the quote.
+// IP_HDRINCL means I write the IP header. The kernel still fills in tot_len and the IP checksum.
+static struct timespec send_paris_probe(Engine *m, int ttl, int tag) {
+    unsigned char pkt[sizeof(struct iphdr) + sizeof(struct udphdr)]; memset(pkt, 0, sizeof(pkt));
+    struct iphdr  *ip  = (struct iphdr *)pkt;
+    struct udphdr *udp = (struct udphdr *)(pkt + sizeof(struct iphdr));
+
+    ip->version  = 4; ip->ihl = 5;              // 20 byte header, no options
+    ip->ttl      = ttl;                         // The one thing bumped each hop
+    ip->protocol = IPPROTO_UDP;
+    ip->id       = htons(paris_id(tag));        // The tag
+    ip->saddr    = m->src.s_addr;
+    ip->daddr    = m->target.sin_addr.s_addr;
+
+    udp->source = htons(m->sport);              // Fixed for the session
+    udp->dest   = m->target.sin_port;           // Fixed too, the 5-tuple never moves
+    udp->len    = htons(sizeof(struct udphdr)); // Empty payload, fixed length
+
+    unsigned char sum[sizeof(struct pseudo_hdr) + sizeof(struct udphdr)]; memset(sum, 0, sizeof(sum));
+    struct pseudo_hdr *ph = (struct pseudo_hdr *)sum;   // UDP checksum is over pseudo-header + UDP
+    ph->src = ip->saddr; ph->dst = ip->daddr; ph->proto = IPPROTO_UDP; ph->len = udp->len;
+    memcpy(sum + sizeof(struct pseudo_hdr), udp, sizeof(struct udphdr));
+    unsigned short c = checksum(sum, sizeof(sum));
+    udp->check = c ? c : 0xFFFF;                // A computed 0 goes out as all ones, 0 means "none"
+
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    if (sendto(m->usock, pkt, sizeof(pkt), 0, (struct sockaddr *)&m->target, sizeof(m->target)) < 0) {
+        t.tv_sec = 0; t.tv_nsec = 0;            // Never left, the FSM times it out at once
+    }
+    return t;
+}
+
+// Sends the right kind of probe for the protocol. tag = ICMP seq, low half of the TCP seq,
+// UDP port offset or Paris IP ID.
 static struct timespec fire_probe(Engine *m, int ttl, int tag) {
     if (m->proto == IPPROTO_TCP) return send_tcp_probe(m, ttl, tag);
-    if (m->proto == IPPROTO_UDP) return send_udp_probe(m, ttl, tag);
+    if (m->proto == IPPROTO_UDP) return m->paris ? send_paris_probe(m, ttl, tag) : send_udp_probe(m, ttl, tag);
     return send_icmp_probe(m->isock, &m->target, ttl, tag);
 }
 ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -976,9 +1034,14 @@ static int parse_icmp(char *buf, int n, struct sockaddr_in *from, Engine *m, int
             if (iip->daddr != m->target.sin_addr.s_addr) return 0;          // Datagram to some other target
             struct udphdr *iudp = (struct udphdr *)(buf + off + iiplen);    // The 8 quoted bytes are the whole UDP header
             int sp = ntohs(iudp->source);
-            if (sp < m->sport || sp >= m->sport + PORT_BLOCK ||
-                iudp->dest != m->target.sin_port) return 0;                 // Not from my block
-            *tag_out = sp - m->sport;                                       // Offset in the block = tag
+            if (iudp->dest != m->target.sin_port) return 0;                 // Some other destination port
+            if (m->paris) {
+                if (sp != m->sport || ntohs(iip->id) == 0) return 0;        // Not my fixed port
+                *tag_out = ntohs(iip->id) - 1;                              // The quoted IP ID = tag
+            } else {
+                if (sp < m->sport || sp >= m->sport + PORT_BLOCK) return 0; // Not from my block
+                *tag_out = sp - m->sport;                                   // Offset in the block = tag
+            }
         }
 
         if (icmp->type == ICMP_DEST_UNREACH) {              // The trace ends here
@@ -1043,9 +1106,10 @@ static int read_reply(Engine *m, int tick_us, int *tag_out,
 }
 
 // Is the incoming tag the same probe as the expected one? The field carrying the tag narrows by
-// protocol: 16 bits for ICMP and TCP, the block offset for UDP. Ping seq grows and wraps, so the
-// compare has to narrow the same way.
+// protocol: 16 bits for ICMP and TCP, the block offset for classic UDP, the IP ID for Paris.
+// Ping seq grows and wraps, so the compare has to narrow the same way.
 static int same_tag(const Engine *m, int got, int want) {
+    if (m->proto == IPPROTO_UDP && m->paris) return got == paris_id(want) - 1;
     if (m->proto == IPPROTO_UDP) return got == want % PORT_BLOCK;
     return got == (want & 0xFFFF);
 }
@@ -1057,7 +1121,7 @@ static int same_tag(const Engine *m, int got, int want) {
 static const char *engine_open(Engine *m, struct in_addr target_ip, int parallel) {
     static int session = 0;                    // Every session gets fresh source ports
     memset(m, 0, sizeof(*m));
-    m->isock = m->tsock = -1;
+    m->isock = m->tsock = m->usock = -1;       // Before any early return, engine_close must not close fd 0
     m->target.sin_family = AF_INET;
     m->target.sin_addr   = target_ip;          // resolve_target already did it, via DNS for a hostname
 
@@ -1082,7 +1146,18 @@ static const char *engine_open(Engine *m, struct in_addr target_ip, int parallel
     if (m->proto == IPPROTO_UDP) {
         if (current_cfg.port < 1) return "UDP needs a port between 1 and 65535.";
         m->target.sin_port = htons(current_cfg.port);
-        m->sport = 40000 + ((getpid() + session++) % 100) * PORT_BLOCK;  // One block per session, tops out at 59999
+        m->paris = settings.udp_paris;
+        if (m->paris) {
+            if (!find_source_ip(&m->target, &m->src)) return "No route to target.";
+            m->usock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+            if (m->usock < 0) return "Cannot open raw UDP socket. Run with sudo (root needed).";
+            int on = 1;
+            if (setsockopt(m->usock, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0)
+                return "Cannot set IP_HDRINCL on the raw UDP socket.";
+            m->sport = 40000 + ((getpid() + session++) % 20000);           // One fixed port per session
+        } else {
+            m->sport = 40000 + ((getpid() + session++) % 100) * PORT_BLOCK;  // One block per session, tops out at 59999
+        }
     }
     return NULL;
 }
@@ -1090,13 +1165,15 @@ static const char *engine_open(Engine *m, struct in_addr target_ip, int parallel
 static void engine_close(Engine *m) {
     if (m->isock >= 0) close(m->isock);
     if (m->tsock >= 0) close(m->tsock);
-    m->isock = m->tsock = -1;
+    if (m->usock >= 0) close(m->usock);
+    m->isock = m->tsock = m->usock = -1;
 }
 
-// Protocol label for the title bar: "ICMP", "TCP 443" or "UDP 33434"
+// Protocol label for the title bar: "ICMP", "TCP 443", "UDP 33434" or "UDP 33434 Paris"
 static void engine_label(const Engine *m, char *out, int len) {
     if      (m->proto == IPPROTO_TCP) snprintf(out, len, "TCP %d", ntohs(m->target.sin_port));
-    else if (m->proto == IPPROTO_UDP) snprintf(out, len, "UDP %d", ntohs(m->target.sin_port));
+    else if (m->proto == IPPROTO_UDP) snprintf(out, len, m->paris ? "UDP %d Paris" : "UDP %d",
+                                               ntohs(m->target.sin_port));
     else                              snprintf(out, len, "ICMP");
 }
 
@@ -1421,6 +1498,7 @@ void track_signal(void) {
                     hops[t].reached = 0;
                     hops[t].flag = 0;
                     hops[t].name[0] = '\0';
+                    for (int p = 0; p < MAX_PROBES; p++) hops[t].ips[p][0] = '\0';
                     if (next_ttl > count) count = next_ttl;
                 }
                 slot_at[t][next_p] = fire_probe(&m, next_ttl, next_ttl * probes + next_p);  // Tag unique per probe
@@ -1443,6 +1521,7 @@ void track_signal(void) {
                 struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
                 hops[t].rtt[p] = ms_between(slot_at[t][p], now);
                 strcpy(hops[t].ip, ip);
+                strcpy(hops[t].ips[p], ip);                          // Every responder kept, not just the last
                 if (flag_rank(flag) > flag_rank(hops[t].flag)) hops[t].flag = flag;   // A weak verdict never overwrites a strong one
                 if (reached) {
                     hops[t].reached = 1;
