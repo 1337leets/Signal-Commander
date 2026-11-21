@@ -37,10 +37,15 @@ typedef struct {
 
 // Checksum ______________________________________________________________________________________
 // 16-bit one's complement sum over the whole packet, folded, then inverted.
-unsigned short checksum(void *b, int len) {
-  unsigned short *buf = b; unsigned int sum = 0; unsigned short result;
-  for (sum = 0; len > 1; len -= 2) sum += *buf++; // Sums word by word
-  if (len == 1) sum += *(unsigned char *)buf;     // Adds the lone trailing byte if odd
+// Words are loaded with memcpy. The packet is filled through struct pointers, and reading it back
+// through an unsigned short pointer breaks strict aliasing, which let gcc -O2 reorder the loads
+// ahead of the stores in udptrace (measured). memcpy is alias-safe and still compiles to one load.
+unsigned short checksum(const void *b, int len) {
+  const unsigned char *p = b; unsigned int sum = 0; unsigned short result;
+  for (; len > 1; len -= 2, p += 2) {             // Sums word by word
+    unsigned short w; memcpy(&w, p, 2); sum += w;
+  }
+  if (len == 1) sum += *p;                        // Adds the lone trailing byte if odd
   sum = (sum >> 16) + (sum & 0xFFFF); sum += (sum >> 16); // Folds the carry back in twice
   result = ~sum; return result;                   // Inverts every bit
 }

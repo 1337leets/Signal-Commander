@@ -759,10 +759,15 @@ static void draw_track(HopResult *hops, int count, int running, const char *labe
 // ICMP Engine (raw echo) ______________________________________________________________________
 // Proven boxes from trace.c. The one difference is waiting no longer blocks. Parsing lives in
 // parse_icmp, select + recvfrom run inside the Track tick loop.
-static unsigned short checksum(void *b, int len) {
-    unsigned short *buf = b; unsigned int sum = 0; unsigned short result;
-    for (sum = 0; len > 1; len -= 2) sum += *buf++;
-    if (len == 1) sum += *(unsigned char *)buf;
+// 16-bit one's complement sum, folded, then inverted. Words are loaded with memcpy: packets are
+// filled through struct pointers, and reading them back through an unsigned short pointer breaks
+// strict aliasing. gcc -O2 really did reorder those loads in udptrace (measured, wrong checksums).
+static unsigned short checksum(const void *b, int len) {
+    const unsigned char *p = b; unsigned int sum = 0; unsigned short result;
+    for (; len > 1; len -= 2, p += 2) {
+        unsigned short w; memcpy(&w, p, 2); sum += w;   // Alias-safe, still one load
+    }
+    if (len == 1) sum += *p;
     sum = (sum >> 16) + (sum & 0xFFFF); sum += (sum >> 16);
     result = ~sum; return result;
 }
