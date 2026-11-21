@@ -3,6 +3,7 @@ signal_commander
 trace
 tcptrace
 udptrace
+dnsq
 *.o
 *.out
 a.out
