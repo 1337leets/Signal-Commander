@@ -45,9 +45,12 @@ typedef struct {
     int probes;                  /* hop basina probe, 1..MAX_PROBES */
     int timeout_ms;              /* track'te probe basina cevap penceresi */
     int dns;                     /* 1 = hostname hedef + hop isimleri (PTR) */
+    int paralel;                 /* ayni anda yolda probe, 1 = sirali (eski davranis) */
 } Ayar;
 
-static Ayar ayar = { 3, 2000, 0 };
+#define MAX_PARALEL 32
+
+static Ayar ayar = { 3, 2000, 0, 16 };   /* 16 = Linux traceroute'un varsayilani */
 
 /* Bir hop: ayar.probes kadar probe'un sonucu tek satirda */
 typedef struct {
@@ -100,12 +103,13 @@ static const FldMeta FIELDS[CFG_FIELDS] = {
     { "Protocol",    FLD_CYCLE,  0, 0,     0, PROTO_OPTS, 3 },
 };
 
-#define AYAR_FIELDS 3
+#define AYAR_FIELDS 4
 
 static const FldMeta AYAR_META[AYAR_FIELDS] = {
-    { "Probes per hop",   FLD_INT,   1,   1, MAX_PROBES, NULL,       0 },
-    { "Hop timeout (ms)", FLD_INT,   5, 100,      10000, NULL,       0 },
-    { "Resolve DNS",      FLD_CYCLE, 0,   0,          0, ONOFF_OPTS, 2 },
+    { "Probes per hop",   FLD_INT,   1,   1, MAX_PROBES,  NULL,       0 },
+    { "Hop timeout (ms)", FLD_INT,   5, 100,      10000,  NULL,       0 },
+    { "Parallel probes",  FLD_INT,   2,   1, MAX_PARALEL, NULL,       0 },
+    { "Resolve DNS",      FLD_CYCLE, 0,   0,          0,  ONOFF_OPTS, 2 },
 };
 
 /* Bir formun tarifi: baslik, alan tablosu, veri <-> string cevirileri.
@@ -124,7 +128,8 @@ static void ayar_to_str(const void *d, int idx, char *out, int outlen) {
     switch (idx) {
         case 0: snprintf(out, outlen, "%d", a->probes);     break;
         case 1: snprintf(out, outlen, "%d", a->timeout_ms); break;
-        case 2: snprintf(out, outlen, "%s", a->dns ? "ON" : "OFF"); break;
+        case 2: snprintf(out, outlen, "%d", a->paralel);    break;
+        case 3: snprintf(out, outlen, "%s", a->dns ? "ON" : "OFF"); break;
     }
 }
 
@@ -134,7 +139,8 @@ static void str_to_ayar(void *d, int idx, const char *s) {
     switch (idx) {
         case 0: a->probes     = atoi(s); break;
         case 1: a->timeout_ms = atoi(s); break;
-        case 2: a->dns        = (strcmp(s, "ON") == 0); break;
+        case 2: a->paralel    = atoi(s); break;
+        case 3: a->dns        = (strcmp(s, "ON") == 0); break;
     }
 }
 
@@ -689,6 +695,16 @@ static const char *flag_yazi(char f) {
     return "";
 }
 
+/* Bir hop'ta birden cok karar gelirse guclu olan kalir. SYN-ACK'i sadece
+ * dinleyen port uretir, en guclu kanit o. Sonra hedefin RST / port
+ * unreachable'i, en zayif yoldaki bir unreachable. */
+static int flag_guc(char f) {
+    if (f == 'O') return 3;
+    if (f == 'C') return 2;
+    if (f == 'U') return 1;
+    return 0;
+}
+
 /* scroll_off = tablonun en ustunde gorunen hop indeksi. takip = 1 iken
  * her cizimde en alta yapisir (yeni hop'lar hep gorunur). Sinirlar burada
  * kirpilir, cunku kac satir sigdigini sadece cizim ani biliyor. */
@@ -832,20 +848,36 @@ struct pseudo_hdr {
 
 /* Bir oturumun (track ya da send) motoru: protokol, soketler, kimlik.
  * ICMP'de sadece isock dolu. TCP'de tsock + src + sport da var.
- * UDP'de sport bir port blogunun basi, probe'lar ayri soketlerden gider. */
+ * UDP'de sport bir port blogunun basi, probe'lar ayri soketlerden gider.
+ * TCP'de port_blok = 1 ise (paralel track) her SYN de bloktan kendi portunu alir. */
 typedef struct {
     int                proto;     /* IPPROTO_ICMP, IPPROTO_TCP ya da IPPROTO_UDP */
     struct sockaddr_in hedef;     /* sin_port TCP ve UDP'de anlamli */
     struct in_addr     src;       /* pseudo-header icin kaynak ip */
     unsigned short     my_id;     /* pid, imzam */
-    uint16_t           sport;     /* TCP: sabit kaynak port. UDP: blok basi */
+    uint16_t           sport;     /* TCP: sabit kaynak port ya da blok basi. UDP: blok basi */
+    int                port_blok; /* TCP: 1 = probe basina port, 0 = sabit port (Paris) */
     int                isock;     /* raw ICMP: echo reply, time exceeded, unreachable */
     int                tsock;     /* raw TCP: SYN at, SYN-ACK / RST dinle. ICMP'de -1 */
 } Motor;
 
+#define PORT_BLOK 200                   /* oturum basina port, track en fazla 30*5+4 = 154 etiket kullanir */
+
 /* TCP seq: ust 16 bit pid, alt 16 bit probe etiketi */
 static uint32_t syn_seq(const Motor *m, int tag) {
     return ((uint32_t)m->my_id << 16) | (uint16_t)tag;
+}
+
+/* SYN'in kaynak portu. Sabit port ayni 4-tuple'dan es zamanli bircok SYN
+ * demek: olculdu, hedef tarafinda SYN-ACK, RST ve sessizlik karisik donuyor.
+ * Paralelde her SYN kendi 4-tuple'ini alir, bedeli ECMP yol tutarliligi. */
+static uint16_t tcp_port(const Motor *m, int tag) {
+    return m->port_blok ? m->sport + (uint16_t)(tag % PORT_BLOK) : m->sport;
+}
+
+/* Gelen paketteki bizim taraftaki port bizim mi, etiketle tutarli mi? */
+static int tcp_port_tutar(const Motor *m, int port, int tag) {
+    return port == tcp_port(m, tag);
 }
 
 /* Pseudo-header kaynak ip istiyor ama onu kernel seciyor. Connect
@@ -864,7 +896,8 @@ static int kaynak_ip_bul(struct sockaddr_in *hedef, struct in_addr *out) {
 
 /* Tek SYN kur ve at. pseudo + TCP header yan yana, ikisinin
  * checksum'i alinir, sadece TCP kismi gonderilir. */
-static struct timespec tcp_probe_gonder(Motor *m, int ttl, uint32_t seq) {
+static struct timespec tcp_probe_gonder(Motor *m, int ttl, int tag) {
+    uint32_t seq = syn_seq(m, tag);
     setsockopt(m->tsock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));   /* her hop'ta artan tek sey */
 
     char packet[sizeof(struct pseudo_hdr) + sizeof(struct tcphdr)];
@@ -872,7 +905,7 @@ static struct timespec tcp_probe_gonder(Motor *m, int ttl, uint32_t seq) {
     struct pseudo_hdr *ph  = (struct pseudo_hdr *)packet;
     struct tcphdr     *tcp = (struct tcphdr *)(packet + sizeof(struct pseudo_hdr));
 
-    tcp->source = htons(m->sport);             /* oturum boyu sabit */
+    tcp->source = htons(tcp_port(m, tag));     /* sirali: sabit, paralel: probe basina */
     tcp->dest   = m->hedef.sin_port;           /* test edilen port */
     tcp->seq    = htonl(seq);                  /* pid + etiket, ICMP quote'unda geri gelir */
     tcp->doff   = 5;                           /* 20 bayt, opsiyon yok */
@@ -901,13 +934,12 @@ static struct timespec tcp_probe_gonder(Motor *m, int ttl, uint32_t seq) {
  *
  *  Kimlik: ICMP quote'unun 8 bayti UDP header'in tamami.
  *  Hedef port config'den sabit, o yuzden etiket kaynak
- *  portta: port = blok basi + tag % UDP_BLOK. Bedeli:
+ *  portta: port = blok basi + tag % PORT_BLOK. Bedeli:
  *  5-tuple probe'dan probe'a degisir, ECMP yolu oynayabilir.
  * ═══════════════════════════════════════════════════ */
-#define UDP_BLOK 200                   /* oturum basina port, track en fazla 30*5+4 = 154 etiket kullanir */
 
 static uint16_t udp_port(const Motor *m, int tag) {
-    return m->sport + (uint16_t)(tag % UDP_BLOK);
+    return m->sport + (uint16_t)(tag % PORT_BLOK);
 }
 
 /* Tek datagram: taze soket, etiket portuna bind, TTL, bos payload, kapat.
@@ -933,17 +965,18 @@ static struct timespec udp_probe_gonder(Motor *m, int ttl, int tag) {
 
 /* Protokole gore dogru probe'u at. tag = ICMP seq, TCP seq'in alt yarisi ya da UDP port ofseti */
 static struct timespec probe_at(Motor *m, int ttl, int tag) {
-    if (m->proto == IPPROTO_TCP) return tcp_probe_gonder(m, ttl, syn_seq(m, tag));
+    if (m->proto == IPPROTO_TCP) return tcp_probe_gonder(m, ttl, tag);
     if (m->proto == IPPROTO_UDP) return udp_probe_gonder(m, ttl, tag);
     return probe_gonder(m->isock, &m->hedef, ttl, tag);
 }
 
-/* ICMP soketinden gelen paketi coz: bizim probe'umuzun cevabi mi?
- * Evetse ip_out'a cevaplayani, reached_out'a "dur" kararini,
- * flag_out'a karar harfini yazar, 1 doner.
- * Gomulu paketin protokolune gore dallanir: ICMP'de id + seq,
- * TCP'de portlar + seq, UDP'de portlar ile eslesir. */
-static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int tag,
+/* ICMP soketinden gelen paketi coz: bizim probe'lardan birinin cevabi mi?
+ * Evetse tag_out'a HANGI probe oldugunu, ip_out'a cevaplayani,
+ * reached_out'a "dur" kararini, flag_out'a karar harfini yazar, 1 doner.
+ * Beklenen etiketi sormaz, bulur: paralel probing'de ayni anda bircok
+ * probe yolda. Gomulu paketin protokolune gore dallanir:
+ * ICMP'de id + seq, TCP'de portlar + seq, UDP'de portlar. */
+static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int *tag_out,
                      char *ip_out, int *reached_out, char *flag_out) {
     if (n < (int)sizeof(struct iphdr) + (int)sizeof(struct icmphdr)) return 0;
     struct iphdr *ip = (struct iphdr *)buf; int iplen = ip->ihl * 4;    /* dis IP header'i atla */
@@ -953,8 +986,8 @@ static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int
 
     if (icmp->type == ICMP_ECHOREPLY) {                     /* A: hedef cevapladi */
         if (m->proto != IPPROTO_ICMP) return 0;             /* TCP/UDP modunda echo reply bizim olamaz */
-        if (ntohs(icmp->un.echo.id) != m->my_id ||
-            ntohs(icmp->un.echo.sequence) != tag) return 0; /* benim degil */
+        if (ntohs(icmp->un.echo.id) != m->my_id) return 0;  /* benim degil */
+        *tag_out = ntohs(icmp->un.echo.sequence);           /* seq = etiket */
         *reached_out = 1;
     } else if (icmp->type == ICMP_TIME_EXCEEDED ||          /* B: router TTL'i bitirdi */
                icmp->type == ICMP_DEST_UNREACH) {           /* C: biri yolu kesti */
@@ -967,18 +1000,22 @@ static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int
         if (m->proto == IPPROTO_ICMP) {
             if (icmp->type != ICMP_TIME_EXCEEDED) return 0; /* ICMP modunda unreachable eskisi gibi yok sayilir */
             struct icmphdr *iicmp = (struct icmphdr *)(buf + off + iiplen); /* gomulu echo header'im */
-            if (ntohs(iicmp->un.echo.id) != m->my_id ||
-                ntohs(iicmp->un.echo.sequence) != tag) return 0;            /* benim probe'um degil */
+            if (ntohs(iicmp->un.echo.id) != m->my_id) return 0;             /* benim probe'um degil */
+            *tag_out = ntohs(iicmp->un.echo.sequence);
         } else if (m->proto == IPPROTO_TCP) {
             if (iip->daddr != m->hedef.sin_addr.s_addr) return 0;           /* baska hedefe giden SYN */
             struct tcphdr *itcp = (struct tcphdr *)(buf + off + iiplen);    /* portlar + seq, otesi yok */
-            if (ntohs(itcp->source) != m->sport || itcp->dest != m->hedef.sin_port ||
-                ntohl(itcp->seq) != syn_seq(m, tag)) return 0;              /* benim SYN'im degil */
+            uint32_t s = ntohl(itcp->seq);
+            if (itcp->dest != m->hedef.sin_port || (s >> 16) != m->my_id ||
+                !tcp_port_tutar(m, ntohs(itcp->source), s & 0xFFFF)) return 0; /* benim SYN'im degil */
+            *tag_out = s & 0xFFFF;                                          /* seq'in alt yarisi = etiket */
         } else {
             if (iip->daddr != m->hedef.sin_addr.s_addr) return 0;           /* baska hedefe giden datagram */
             struct udphdr *iudp = (struct udphdr *)(buf + off + iiplen);    /* quote'un 8 bayti tam UDP header */
-            if (ntohs(iudp->source) != udp_port(m, tag) ||
-                iudp->dest != m->hedef.sin_port) return 0;                  /* benim datagramim degil */
+            int sp = ntohs(iudp->source);
+            if (sp < m->sport || sp >= m->sport + PORT_BLOK ||
+                iudp->dest != m->hedef.sin_port) return 0;                  /* benim blogumdan degil */
+            *tag_out = sp - m->sport;                                       /* blok ici ofset = etiket */
         }
 
         if (icmp->type == ICMP_DEST_UNREACH) {              /* trace burada biter */
@@ -996,15 +1033,18 @@ static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int
 /* TCP soketinden gelen paketi coz: hedef SYN'imize SYN-ACK ya da RST mi dondu?
  * Portlar + ack = seq + 1 tutmali. Raw TCP soketi hosttaki BUTUN TCP'nin
  * kopyasini aliyor, filtre sart. */
-static int tcp_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int tag,
+static int tcp_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int *tag_out,
                    char *ip_out, int *reached_out, char *flag_out) {
     if (n < (int)sizeof(struct iphdr)) return 0;
     struct iphdr *ip = (struct iphdr *)buf; int iplen = ip->ihl * 4;
     if (ip->saddr != m->hedef.sin_addr.s_addr) return 0;                  /* hedeften gelmiyor */
     if (n < iplen + (int)sizeof(struct tcphdr)) return 0;
     struct tcphdr *tcp = (struct tcphdr *)(buf + iplen);
-    if (tcp->source != m->hedef.sin_port || ntohs(tcp->dest) != m->sport) return 0; /* baska baglanti */
-    if (!tcp->ack || ntohl(tcp->ack_seq) != syn_seq(m, tag) + 1) return 0;          /* baska SYN'in cevabi */
+    if (tcp->source != m->hedef.sin_port) return 0;                       /* baska baglanti */
+    uint32_t s = ntohl(tcp->ack_seq) - 1;                                  /* ack = benim seq + 1 */
+    if (!tcp->ack || (s >> 16) != m->my_id ||
+        !tcp_port_tutar(m, ntohs(tcp->dest), s & 0xFFFF)) return 0;       /* baska SYN'in cevabi */
+    *tag_out = s & 0xFFFF;
 
     if (tcp->syn)      *flag_out = 'O';                    /* SYN-ACK, port acik */
     else if (tcp->rst) *flag_out = 'C';                    /* RST, port kapali */
@@ -1014,34 +1054,44 @@ static int tcp_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int t
     return 1;
 }
 
-/* Bir tick boyunca soketleri yokla. Bizim cevap geldiyse 1 doner.
- * select en fazla tick_us bekler, UI donmaz. Yabanci paketler
- * sonraki turlarda bosalir. */
-static int cevap_oku(Motor *m, int tag, int tick_us,
+/* Soketleri en fazla tick_us yokla, gelen bir paketi coz.
+ * 1 = bizim probe'lardan birinin cevabi (tag_out dolu), 0 = yabanci paket,
+ * -1 = okunacak bir sey yok. Cagiran 0 / 1 geldikce tick_us=0 ile tekrar
+ * cagirip birikenleri bosaltabilir. */
+static int cevap_oku(Motor *m, int tick_us, int *tag_out,
                      char *ip_out, int *reached_out, char *flag_out) {
     fd_set rfds; FD_ZERO(&rfds); FD_SET(m->isock, &rfds);
     int maxfd = m->isock;
     if (m->tsock >= 0) { FD_SET(m->tsock, &rfds); if (m->tsock > maxfd) maxfd = m->tsock; }
     struct timeval tv = { 0, tick_us };
-    if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) return 0;
+    if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) return -1;
 
     char buf[1024]; struct sockaddr_in kaynak; socklen_t kl;
     if (FD_ISSET(m->isock, &rfds)) {                        /* router, firewall ya da echo reply */
         kl = sizeof(kaynak);
         int n = recvfrom(m->isock, buf, sizeof(buf), 0, (struct sockaddr *)&kaynak, &kl);
-        if (n > 0 && paket_coz(buf, n, &kaynak, m, tag, ip_out, reached_out, flag_out)) return 1;
+        if (n > 0 && paket_coz(buf, n, &kaynak, m, tag_out, ip_out, reached_out, flag_out)) return 1;
     }
     if (m->tsock >= 0 && FD_ISSET(m->tsock, &rfds)) {       /* hedefin kendisi */
         kl = sizeof(kaynak);
         int n = recvfrom(m->tsock, buf, sizeof(buf), 0, (struct sockaddr *)&kaynak, &kl);
-        if (n > 0 && tcp_coz(buf, n, &kaynak, m, tag, ip_out, reached_out, flag_out)) return 1;
+        if (n > 0 && tcp_coz(buf, n, &kaynak, m, tag_out, ip_out, reached_out, flag_out)) return 1;
     }
     return 0;
 }
 
+/* Gelen etiket beklenenle ayni probe mu? Etiketin tasindigi alan protokole
+ * gore daraliyor: ICMP / TCP 16 bit, UDP blok ici ofset. Ping'de seq buyudukce
+ * sarar, karsilastirma ayni daralmayla yapilmali. */
+static int ayni_tag(const Motor *m, int got, int want) {
+    if (m->proto == IPPROTO_UDP) return got == want % PORT_BLOK;
+    return got == (want & 0xFFFF);
+}
+
 /* Config'e gore motoru kur. Hata varsa ekranda gosterilecek mesaji
- * doner, yoksa NULL. Hata durumunda da motor_kapat cagrilmali. */
-static const char *motor_ac(Motor *m, struct in_addr hedef_ip) {
+ * doner, yoksa NULL. Hata durumunda da motor_kapat cagrilmali.
+ * paralel = 1 ise TCP probe basina kaynak port kullanir. */
+static const char *motor_ac(Motor *m, struct in_addr hedef_ip, int paralel) {
     static int oturum = 0;                     /* her oturum yeni kaynak port */
     memset(m, 0, sizeof(*m));
     m->isock = m->tsock = -1;
@@ -1062,12 +1112,14 @@ static const char *motor_ac(Motor *m, struct in_addr hedef_ip) {
         if (!kaynak_ip_bul(&m->hedef, &m->src)) return "No route to target.";
         m->tsock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
         if (m->tsock < 0) return "Cannot open raw TCP socket. Run with sudo (root needed).";
-        m->sport = 40000 + ((getpid() + oturum++) % 20000);  /* gec gelen eski SYN-ACK karismasin */
+        m->port_blok = paralel;
+        if (paralel) m->sport = 40000 + ((getpid() + oturum++) % 100) * PORT_BLOK;  /* oturum basina blok */
+        else         m->sport = 40000 + ((getpid() + oturum++) % 20000);  /* gec gelen eski SYN-ACK karismasin */
     }
     if (m->proto == IPPROTO_UDP) {
         if (current_cfg.port < 1) return "UDP needs a port between 1 and 65535.";
         m->hedef.sin_port = htons(current_cfg.port);
-        m->sport = 40000 + ((getpid() + oturum++) % 100) * UDP_BLOK;  /* oturum basina ayri blok, en fazla 59999 */
+        m->sport = 40000 + ((getpid() + oturum++) % 100) * PORT_BLOK;  /* oturum basina ayri blok, en fazla 59999 */
     }
     return NULL;
 }
@@ -1349,26 +1401,32 @@ static void ptr_tick(int s, HopResult *hops, int count, PtrIs *p) {
 }
 
 /* ═══════════════════════════════════════════════════
- *  TRACK SIGNAL — GERCEK FSM
+ *  TRACK SIGNAL — PARALEL FSM
  *
- *  Bloklamayan tick dongusu. Her turda: klavyeyi yokla,
- *  state makinesini bir adim ilerlet, tabloyu ciz.
+ *  Bloklamayan tick dongusu. Probe'lar slot'larda:
+ *  pd[hop][p] = 0 atilmadi, 1 yolda, 2 bitti. Etiket
+ *  ttl*probes+p benzersiz, cevap etiketinden dogrudan
+ *  kendi slot'una gider. Her tick:
  *
- *    SEND : probe at (ttl, seq), sent_at kaydet -> WAIT
- *    WAIT : select ile soketi kisa yokla + deadline'a bak
- *           cevap geldi YA DA timeout -> ilerle
- *    DONE : hedefe varildi ya da ttl limiti doldu; tablo dursun
+ *    1. klavye
+ *    2. pencere dolana kadar siradaki probe'lari at
+ *    3. gelen cevaplari bosalt (tick basina en fazla 64)
+ *    4. suresi dolanlari timeout say
+ *    5. stop_ttl'e kadar her sey bittiyse DONE
  *
- *  ilerle: probe++ ; ayar.probes dolunca hop++ (ya da DONE)
+ *  Durma: bir probe hedefe varinca stop_ttl o hop'a
+ *  cekilir, otesine probe atilmaz, yoldakiler birakilir.
+ *  Pencere 1 = eski sirali davranis (at, bekle, siradaki).
  * ═══════════════════════════════════════════════════ */
-enum { ST_SEND, ST_WAIT, ST_DONE };
+enum { ST_SEND, ST_WAIT, ST_DONE };               /* send_signal hala kullaniyor */
+#define MAX_TICK_PAKET 64                         /* raw TCP soketi hosttaki her TCP'yi goruyor, dongu kilitlenmesin */
 
 void track_signal(void) {
     /* Hedefi coz (hostname ise DNS), protokolu config'den al, soketleri ac */
     struct in_addr hedef_ip;
     if (!hedef_coz(current_cfg.ip, &hedef_ip)) return;
     Motor m;
-    const char *hata = motor_ac(&m, hedef_ip);
+    const char *hata = motor_ac(&m, hedef_ip, ayar.paralel > 1);   /* paralelde TCP probe basina port */
     if (hata) { motor_kapat(&m); motor_hata(hata); return; }   /* raw socket root ister */
     char etiket[16]; motor_etiket(&m, etiket, sizeof(etiket));
     char hedef_y[96]; hedef_yazisi(current_cfg.ip, hedef_ip, hedef_y, sizeof(hedef_y));
@@ -1384,12 +1442,17 @@ void track_signal(void) {
     if (probes < 1) probes = 1;
     if (probes > MAX_PROBES) probes = MAX_PROBES;
     double timeout_ms = ayar.timeout_ms;
+    int pencere = ayar.paralel;                /* ayni anda yolda en fazla bu kadar probe */
+    if (pencere < 1) pencere = 1;
+    if (pencere > MAX_PARALEL) pencere = MAX_PARALEL;
 
     HopResult hops[MAX_HOPS]; memset(hops, 0, sizeof(hops));
+    int pd[MAX_HOPS][MAX_PROBES]; memset(pd, 0, sizeof(pd));       /* slot durumu: 0 / 1 yolda / 2 bitti */
+    struct timespec pt[MAX_HOPS][MAX_PROBES];                     /* slot'un gonderim ani */
 
-    int ttl = 1, probe = 0, count = 0, seq = 0;
-    int state = ST_SEND, running = 1;
-    struct timespec sent_at = {0, 0};
+    int next_ttl = 1, next_p = 0;              /* siradaki atilacak probe */
+    int stop_ttl = limit;                      /* hedefe varilinca kuculur */
+    int yolda = 0, count = 0, running = 1;
     int scroll_off = 0, takip = 1;             /* tablo penceresi, baslangicta en alti takip et */
 
     nodelay(stdscr, TRUE);                     /* getch bloklamasin, dongu donsun */
@@ -1401,56 +1464,69 @@ void track_signal(void) {
         if (k == KEY_UP)   { scroll_off--; takip = 0; }  /* yukari bakan takibi birakir */
         if (k == KEY_DOWN) { scroll_off++; }             /* dibe varinca draw_track takibi geri acar */
 
-        /* ── 2. FSM adimi ───────────────────────────── */
-        if (state == ST_SEND) {
-            if (probe == 0) {                  /* yeni hop: satiri sifirla */
-                hops[ttl-1].hop = ttl;
-                for (int p = 0; p < MAX_PROBES; p++) hops[ttl-1].rtt[p] = -1.0;
-                hops[ttl-1].ip[0] = '\0';
-                hops[ttl-1].reached = 0;
-                hops[ttl-1].flag = 0;
-                hops[ttl-1].name[0] = '\0';
-                count = ttl;
+        if (running) {
+            /* ── 2. Pencere dolana kadar siradakileri at ── */
+            while (yolda < pencere && next_ttl <= stop_ttl) {
+                int t = next_ttl - 1;
+                if (next_p == 0) {             /* yeni hop: satiri sifirla */
+                    hops[t].hop = next_ttl;
+                    for (int p = 0; p < MAX_PROBES; p++) hops[t].rtt[p] = -1.0;
+                    hops[t].ip[0] = '\0';
+                    hops[t].reached = 0;
+                    hops[t].flag = 0;
+                    hops[t].name[0] = '\0';
+                    if (next_ttl > count) count = next_ttl;
+                }
+                pt[t][next_p] = probe_at(&m, next_ttl, next_ttl * probes + next_p);  /* etiket probe basina benzersiz */
+                pd[t][next_p] = 1; yolda++;
+                if (++next_p >= probes) { next_p = 0; next_ttl++; }
             }
-            seq = ttl * probes + probe;         /* probe basina benzersiz */
-            sent_at = probe_at(&m, ttl, seq);
-            state = ST_WAIT;
-        }
-        else if (state == ST_WAIT) {
-            int bitti = 0;                      /* bu probe icin karar verildi mi */
 
-            char ip[INET_ADDRSTRLEN]; int reached = 0; char flag = 0;
-            if (cevap_oku(&m, seq, 60000, ip, &reached, &flag)) {   /* 60 ms tick, UI donmaz */
+            /* ── 3. Gelen cevaplari bosalt, etiketten slot'a dagit ── */
+            int tick_us = 60000;                /* ilk bekleme 60 ms, UI donmaz */
+            for (int i = 0; i < MAX_TICK_PAKET; i++) {
+                char ip[INET_ADDRSTRLEN]; int reached = 0, tag = -1; char flag = 0;
+                int r = cevap_oku(&m, tick_us, &tag, ip, &reached, &flag);
+                if (r < 0) break;               /* okunacak bir sey kalmadi */
+                tick_us = 0;                    /* ilkinden sonra sadece birikenleri al */
+                if (r == 0) continue;           /* yabanci paket */
+
+                int t = tag / probes - 1, p = tag % probes;          /* etiket -> slot */
+                if (tag < probes || t >= limit || pd[t][p] != 1) continue;   /* gec kalan ya da birakilmis */
+                pd[t][p] = 2; yolda--;
+
                 struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-                hops[ttl-1].rtt[probe] = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
-                                         (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
-                strcpy(hops[ttl-1].ip, ip);
-                if (reached) hops[ttl-1].reached = 1;
-                if (flag)    hops[ttl-1].flag = flag;               /* TCP karari, herhangi bir probe'dan */
-                bitti = 1;
-            }
-
-            if (!bitti) {                       /* cevap yoksa deadline'a bak */
-                struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-                double gecen = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
-                               (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
-                if (gecen >= timeout_ms) bitti = 1;             /* rtt -1 kalir */
-            }
-
-            if (bitti) {                        /* ilerle: sonraki probe ya da sonraki hop */
-                probe++;
-                if (probe >= probes) {
-                    probe = 0;
-                    if (hops[ttl-1].reached || ttl >= limit) state = ST_DONE;
-                    else { ttl++; state = ST_SEND; }
-                } else {
-                    state = ST_SEND;
+                hops[t].rtt[p] = ms_fark(pt[t][p], now);
+                strcpy(hops[t].ip, ip);
+                if (flag_guc(flag) > flag_guc(hops[t].flag)) hops[t].flag = flag;   /* zayif karar gucluyu ezmesin */
+                if (reached) {
+                    hops[t].reached = 1;
+                    if (t + 1 < stop_ttl) {                          /* daha yakinda hedef bulundu */
+                        stop_ttl = t + 1;
+                        for (int tt = stop_ttl; tt < limit; tt++)    /* otesindeki yoldakileri birak */
+                            for (int pp = 0; pp < probes; pp++)
+                                if (pd[tt][pp] == 1) { pd[tt][pp] = 2; yolda--; }
+                        if (count > stop_ttl) count = stop_ttl;      /* tabloda hedefin otesi gorunmesin */
+                    }
                 }
             }
-        }
-        else {                                  /* ST_DONE */
-            running = 0;
-            napms(30);                          /* bosa donmesin */
+
+            /* ── 4. Suresi dolanlar timeout, rtt -1 kalir ── */
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            for (int t = 0; t < count; t++)
+                for (int p = 0; p < probes; p++)
+                    if (pd[t][p] == 1 && ms_fark(pt[t][p], now) >= timeout_ms) { pd[t][p] = 2; yolda--; }
+
+            /* ── 5. stop_ttl'e kadar hepsi bittiyse DONE ── */
+            if (next_ttl > stop_ttl) {
+                int acik = 0;
+                for (int t = 0; t < stop_ttl; t++)
+                    for (int p = 0; p < probes; p++)
+                        if (pd[t][p] == 1) acik = 1;
+                if (!acik) running = 0;
+            }
+        } else {
+            napms(30);                          /* DONE: bosa donmesin, DNS isimleri gelmeye devam eder */
         }
 
         /* ── 2b. DNS: yeni IP'lere PTR, gelen isimler ── */
@@ -1537,7 +1613,7 @@ void send_signal(void) {
     struct in_addr hedef_ip;
     if (!hedef_coz(current_cfg.ip, &hedef_ip)) return;
     Motor m;
-    const char *hata = motor_ac(&m, hedef_ip);
+    const char *hata = motor_ac(&m, hedef_ip, 0);              /* ping tek tek gider, sabit port yeter */
     if (hata) { motor_kapat(&m); motor_hata(hata); return; }
     char etiket[16]; motor_etiket(&m, etiket, sizeof(etiket));
     char hedef_y[96]; hedef_yazisi(current_cfg.ip, hedef_ip, hedef_y, sizeof(hedef_y));
@@ -1563,7 +1639,9 @@ void send_signal(void) {
         }
         else {  /* ST_WAIT: 1 sn'lik pencere, cevap ya da timeout, sonra sonraki ping */
             char ip[INET_ADDRSTRLEN]; int reached = 0; char flag = 0;
-            int geldi = cevap_oku(&m, seq, 60000, ip, &reached, &flag);  /* her turda yokla, bos donmesin */
+            int tag = -1;
+            int geldi = (cevap_oku(&m, 60000, &tag, ip, &reached, &flag) == 1 &&  /* her turda yokla, bos donmesin */
+                         ayni_tag(&m, tag, seq));                                /* onceki ping'in gec cevabi sayilmaz */
             if (!recorded && geldi) {
                 struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
                 double rtt = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
