@@ -31,7 +31,7 @@
 
 // Find Resolver _________________________________________________________________________________
 // First IPv4 nameserver line in resolv.conf wins, IPv6 ones are skipped.
-int resolver_bul(struct in_addr *out) {
+int find_resolver(struct in_addr *out) {
   FILE *f = fopen("/etc/resolv.conf", "r");
   if (!f) return 0;
   char line[256], ip[64]; int ok = 0;
@@ -45,7 +45,7 @@ int resolver_bul(struct in_addr *out) {
 // Random ID _____________________________________________________________________________________
 // DNS has no handshake, the 16-bit ID and the source port are all that stop a spoofed answer.
 // A guessable ID is how cache poisoning works, so this one comes from the kernel RNG.
-uint16_t rastgele_id(void) {
+uint16_t random_id(void) {
   uint16_t id = 0; int fd = open("/dev/urandom", O_RDONLY);
   if (fd < 0 || read(fd, &id, sizeof(id)) != sizeof(id))
     id = (uint16_t)(getpid() ^ time(NULL));        // Falls back to something, still better than 0
@@ -57,7 +57,7 @@ uint16_t rastgele_id(void) {
 // Encode Name ___________________________________________________________________________________
 // "www.google.com" becomes 3www6google3com0. Returns bytes written, -1 if a label or the name is
 // too long or empty. A trailing dot is fine.
-int isim_yaz(const char *name, unsigned char *out, int cap) {
+int encode_name(const char *name, unsigned char *out, int cap) {
   int n = 0; const char *p = name;
   while (*p) {
     const char *dot = strchr(p, '.');
@@ -76,13 +76,13 @@ int isim_yaz(const char *name, unsigned char *out, int cap) {
 
 // Build Query ___________________________________________________________________________________
 // 12 byte header written byte by byte, no struct, so endianness and padding never come up.
-int sorgu_kur(unsigned char *buf, int cap, uint16_t id, const char *name, uint16_t qtype) {
+int build_query(unsigned char *buf, int cap, uint16_t id, const char *name, uint16_t qtype) {
   if (cap < 12 + 1 + 4) return -1;
   memset(buf, 0, 12);
   buf[0] = id >> 8; buf[1] = id & 0xFF;            // ID, the answer must echo it
   buf[2] = 0x01;                                   // RD=1, asks the resolver to do the recursion
   buf[5] = 1;                                      // QDCOUNT = 1, the rest stay 0
-  int n = isim_yaz(name, buf + 12, cap - 12 - 4);
+  int n = encode_name(name, buf + 12, cap - 12 - 4);
   if (n < 0) return -1;
   int off = 12 + n;
   buf[off++] = qtype >> 8; buf[off++] = qtype & 0xFF; // QTYPE
@@ -93,7 +93,7 @@ int sorgu_kur(unsigned char *buf, int cap, uint16_t id, const char *name, uint16
 
 // Reverse Name __________________________________________________________________________________
 // 8.8.4.4 becomes 4.4.8.8.in-addr.arpa, octets flipped so the tree is walked from the network down.
-void ptr_isim(struct in_addr a, char *out, int cap) {
+void ptr_name(struct in_addr a, char *out, int cap) {
   unsigned char *b = (unsigned char *)&a.s_addr;   // Network order, b[0] is the first octet
   snprintf(out, cap, "%u.%u.%u.%u.in-addr.arpa", b[3], b[2], b[1], b[0]);
 }
@@ -102,7 +102,7 @@ void ptr_isim(struct in_addr a, char *out, int cap) {
 // Decode Name ___________________________________________________________________________________
 // Reads a possibly compressed name at off into dotted text. Returns the offset just past the name
 // where it sits in the record (not where a pointer jumped to), -1 on anything malformed.
-int isim_oku(const unsigned char *msg, int len, int off, char *out, int cap) {
+int decode_name(const unsigned char *msg, int len, int off, char *out, int cap) {
   int pos = off, end = -1, w = 0, jumps = 0;
   if (cap < 1) return -1;
   while (1) {
@@ -133,7 +133,7 @@ int isim_oku(const unsigned char *msg, int len, int off, char *out, int cap) {
 
 // Parse Answer __________________________________________________________________________________
 // Returns 1 if this was the answer to my query (and prints it), 0 if not mine, -1 if mine but broken.
-int cevap_coz(const unsigned char *msg, int len, uint16_t id) {
+int parse_answer(const unsigned char *msg, int len, uint16_t id) {
   static const char *RCODE[] = { "NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED" };
   if (len < 12) return 0;
   if (((msg[0] << 8) | msg[1]) != id) return 0;    // Some other query's answer
@@ -146,12 +146,12 @@ int cevap_coz(const unsigned char *msg, int len, uint16_t id) {
 
   int off = 12; char name[256];
   for (int i = 0; i < qd; i++) {                   // Skips the echoed question section
-    off = isim_oku(msg, len, off, name, sizeof(name));
+    off = decode_name(msg, len, off, name, sizeof(name));
     if (off < 0 || off + 4 > len) return -1;
     off += 4;                                      // QTYPE + QCLASS
   }
   for (int i = 0; i < an; i++) {
-    off = isim_oku(msg, len, off, name, sizeof(name));
+    off = decode_name(msg, len, off, name, sizeof(name));
     if (off < 0 || off + 10 > len) return -1;      // Fixed part: type, class, ttl, rdlength
     int type  = (msg[off] << 8) | msg[off + 1];
     uint32_t ttl = ((uint32_t)msg[off + 4] << 24) | (msg[off + 5] << 16) | (msg[off + 6] << 8) | msg[off + 7];
@@ -164,7 +164,7 @@ int cevap_coz(const unsigned char *msg, int len, uint16_t id) {
       inet_ntop(AF_INET, msg + off, val, sizeof(val));
       printf("%-32s A      %-16s ttl %u\n", name, val, ttl);
     } else if (type == T_PTR || type == T_CNAME) {  // Both carry a name, maybe compressed
-      if (isim_oku(msg, len, off, val, sizeof(val)) < 0) return -1;
+      if (decode_name(msg, len, off, val, sizeof(val)) < 0) return -1;
       printf("%-32s %-6s %-16s ttl %u\n", name, type == T_PTR ? "PTR" : "CNAME", val, ttl);
     } else {
       printf("%-32s type %d, %d bytes skipped\n", name, type, rdlen);
@@ -188,19 +188,19 @@ int main(int argc, char *argv[]) {
   if (reverse) {
     struct in_addr a;
     if (inet_pton(AF_INET, arg, &a) != 1) { fprintf(stderr, "Not a valid IPv4 address: %s\n", arg); return 1; }
-    ptr_isim(a, qname, sizeof(qname)); qtype = T_PTR;
+    ptr_name(a, qname, sizeof(qname)); qtype = T_PTR;
   } else {
     snprintf(qname, sizeof(qname), "%s", arg); qtype = T_A;
   }
 
   struct sockaddr_in ns; memset(&ns, 0, sizeof(ns));
   ns.sin_family = AF_INET; ns.sin_port = htons(DNS_PORT);
-  if (srv ? inet_pton(AF_INET, srv, &ns.sin_addr) != 1 : !resolver_bul(&ns.sin_addr)) {
+  if (srv ? inet_pton(AF_INET, srv, &ns.sin_addr) != 1 : !find_resolver(&ns.sin_addr)) {
     fprintf(stderr, "No usable nameserver\n"); return 1;
   }
 
-  unsigned char q[512]; uint16_t id = rastgele_id();
-  int qlen = sorgu_kur(q, sizeof(q), id, qname, qtype);
+  unsigned char q[512]; uint16_t id = random_id();
+  int qlen = build_query(q, sizeof(q), id, qname, qtype);
   if (qlen < 0) { fprintf(stderr, "Bad name: %s\n", qname); return 1; }
 
   int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -216,16 +216,16 @@ int main(int argc, char *argv[]) {
   unsigned char r[1500];
   while (1) {
     struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-    double kalan = deadline - (now.tv_sec * 1000.0 + now.tv_nsec / 1e6);
-    if (kalan <= 0) { printf(";; timeout after %d ms\n", TIMEOUT_MS); return 2; }
-    struct timeval tv = { (time_t)(kalan / 1000), (suseconds_t)((kalan - (int)(kalan / 1000) * 1000) * 1000) };
+    double left = deadline - (now.tv_sec * 1000.0 + now.tv_nsec / 1e6);
+    if (left <= 0) { printf(";; timeout after %d ms\n", TIMEOUT_MS); return 2; }
+    struct timeval tv = { (time_t)(left / 1000), (suseconds_t)((left - (int)(left / 1000) * 1000) * 1000) };
     fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
     if (select(s + 1, &rf, NULL, NULL, &tv) <= 0) continue;
 
     int n = recv(s, r, sizeof(r), 0);
     if (n <= 0) continue;                          // ICMP port unreachable from a dead server lands here too
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-    int rc = cevap_coz(r, n, id);
+    int rc = parse_answer(r, n, id);
     if (rc == 0) continue;                         // Stale or foreign, keep waiting
     if (rc < 0) { printf(";; malformed answer, %d bytes\n", n); return 3; }
     printf(";; %d byte answer in %.2f ms\n", n,

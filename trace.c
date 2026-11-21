@@ -21,14 +21,14 @@
 #define TIMEOUT_SEC 2
 #define PROBES      3
 
-// One probe's answer. Filled by cevap_bekle.
+// One probe's answer. Filled by wait_reply.
 typedef struct {
   char   ip[INET_ADDRSTRLEN]; // Who answered, empty on timeout
   double rtt;                 // Round trip in ms, -1 means no reply
   int    reached;             // 1 if this was the destination itself
-} Cevap;
+} Reply;
 
-// One hop, PROBES probes folded together. Filled by hop_izle, printed by hop_bas.
+// One hop, PROBES probes folded together. Filled by track_hop, printed by print_hop.
 typedef struct {
   char   ip[INET_ADDRSTRLEN]; // Responder for this hop, empty if none answered
   double rtt[PROBES];         // One RTT per probe, -1 for the ones that timed out
@@ -47,7 +47,7 @@ unsigned short checksum(void *b, int len) {
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Open Socket ___________________________________________________________________________________
-int icmp_soket_ac(void) {
+int open_icmp_socket(void) {
   int s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP); // Raw ICMP, kernel still builds the outer IP hdr
   if (s < 0) { perror("socket (need root or CAP_NET_RAW)"); exit(1); } // Dies early if unprivileged
   return s;
@@ -55,7 +55,7 @@ int icmp_soket_ac(void) {
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Resolve Target ________________________________________________________________________________
-struct sockaddr_in hedefi_coz(const char *ip) {
+struct sockaddr_in resolve_target(const char *ip) {
   struct sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET;
   if (inet_pton(AF_INET, ip, &a.sin_addr) <= 0) {  // Parses the dotted quad, does no DNS
     fprintf(stderr, "Not a valid IPv4 address: %s\n", ip); exit(1);
@@ -66,7 +66,7 @@ struct sockaddr_in hedefi_coz(const char *ip) {
 
 // Send Probe ____________________________________________________________________________________
 // ttl sets how far the packet gets, seq is the tag I match the reply against.
-struct timespec probe_gonder(int sock, struct sockaddr_in *hedef, int ttl, int seq) {
+struct timespec send_probe(int sock, struct sockaddr_in *target, int ttl, int seq) {
   setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)); // Sets the TTL, the one thing bumped each hop
 
   char packet[64]; memset(packet, 0, sizeof(packet)); // Declares & zeroes the packet buffer
@@ -80,33 +80,33 @@ struct timespec probe_gonder(int sock, struct sockaddr_in *hedef, int ttl, int s
   icmp->checksum = checksum(packet, sizeof(struct icmphdr) + 32); // Checksums with the field at 0, else dropped
 
   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); // Grabs the send instant for RTT
-  if (sendto(sock, packet, sizeof(struct icmphdr) + 32, 0, (struct sockaddr *)hedef, sizeof(*hedef)) <= 0)
+  if (sendto(sock, packet, sizeof(struct icmphdr) + 32, 0, (struct sockaddr *)target, sizeof(*target)) <= 0)
     perror("sendto"); // On fail this probe just shows *, loop carries on
   return t; // Returns the send instant
 }
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Wait Reply ____________________________________________________________________________________
-// Listens until the reply carrying beklenen_seq comes back or the deadline passes.
-Cevap cevap_bekle(int sock, int beklenen_seq, struct timespec t0) {
-  Cevap c = { .ip = "", .rtt = -1.0, .reached = 0 }; // Defaults to a timed-out probe
+// Listens until the reply carrying want_seq comes back or the deadline passes.
+Reply wait_reply(int sock, int want_seq, struct timespec t0) {
+  Reply c = { .ip = "", .rtt = -1.0, .reached = 0 }; // Defaults to a timed-out probe
   uint16_t my_id = getpid() & 0xFFFF;
 
   double deadline = (t0.tv_sec + TIMEOUT_SEC) * 1000.0 + t0.tv_nsec / 1000000.0; // Pins the deadline once
 
-  char buf[1024]; struct sockaddr_in kaynak; socklen_t klen = sizeof(kaynak);
+  char buf[1024]; struct sockaddr_in from; socklen_t klen = sizeof(from);
 
   while (1) {
     struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-    double kalan = deadline - (now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0); // Recomputes the time left each pass
-    if (kalan <= 0) break; // Out of time, returns the timeout default
+    double left = deadline - (now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0); // Recomputes the time left each pass
+    if (left <= 0) break; // Out of time, returns the timeout default
 
-    struct timeval tv; tv.tv_sec = (time_t)(kalan / 1000.0);
-    tv.tv_usec = (suseconds_t)((kalan - tv.tv_sec * 1000.0) * 1000.0);
+    struct timeval tv; tv.tv_sec = (time_t)(left / 1000.0);
+    tv.tv_usec = (suseconds_t)((left - tv.tv_sec * 1000.0) * 1000.0);
     if (tv.tv_sec == 0 && tv.tv_usec == 0) tv.tv_usec = 1; // Floors to 1us, else {0,0} blocks forever
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); // Caps this recvfrom at whatever is left
 
-    int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&kaynak, &klen);
+    int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &klen);
     if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; continue; } // Real timeout vs stray wakeup
 
     if (n < (int)sizeof(struct iphdr) + (int)sizeof(struct icmphdr)) continue; // Too short to hold both headers
@@ -115,7 +115,7 @@ Cevap cevap_bekle(int sock, int beklenen_seq, struct timespec t0) {
     struct icmphdr *icmp = (struct icmphdr *)(buf + iplen); // Steps over the outer IP into ICMP
 
     if (icmp->type == ICMP_ECHOREPLY) {                // Case A: this is the target answering
-      if (ntohs(icmp->un.echo.id) != my_id || ntohs(icmp->un.echo.sequence) != beklenen_seq) continue; // Not mine
+      if (ntohs(icmp->un.echo.id) != my_id || ntohs(icmp->un.echo.sequence) != want_seq) continue; // Not mine
       c.reached = 1;
     }
     else if (icmp->type == ICMP_TIME_EXCEEDED) {       // Case B: a router burned the TTL to 0
@@ -124,13 +124,13 @@ Cevap cevap_bekle(int sock, int beklenen_seq, struct timespec t0) {
       struct iphdr *iip = (struct iphdr *)(buf + off); int iiplen = iip->ihl * 4; // Embedded IP header length
       if (n < off + iiplen + (int)sizeof(struct icmphdr)) continue;
       struct icmphdr *iicmp = (struct icmphdr *)(buf + off + iiplen); // My original echo header, buried inside
-      if (ntohs(iicmp->un.echo.id) != my_id || ntohs(iicmp->un.echo.sequence) != beklenen_seq) continue; // Not mine
+      if (ntohs(iicmp->un.echo.id) != my_id || ntohs(iicmp->un.echo.sequence) != want_seq) continue; // Not mine
     }
     else continue; // Some unrelated ICMP, ignore it
 
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     c.rtt = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1000000.0; // Measures RTT from send
-    inet_ntop(AF_INET, &kaynak.sin_addr, c.ip, sizeof(c.ip)); // Records the responder address
+    inet_ntop(AF_INET, &from.sin_addr, c.ip, sizeof(c.ip)); // Records the responder address
     break;
   }
   return c;
@@ -139,14 +139,14 @@ Cevap cevap_bekle(int sock, int beklenen_seq, struct timespec t0) {
 
 // Track Hop _____________________________________________________________________________________
 // Fires PROBES probes at one ttl, folds their answers into a single Hop.
-Hop hop_izle(int sock, struct sockaddr_in *hedef, int ttl) {
+Hop track_hop(int sock, struct sockaddr_in *target, int ttl) {
   Hop h; memset(&h, 0, sizeof(h)); // Zeroes the hop, ip empty and reached 0
   for (int p = 0; p < PROBES; p++) h.rtt[p] = -1.0; // Marks every probe as timed out until proven otherwise
 
   for (int p = 0; p < PROBES; p++) {
     int seq = ttl * PROBES + p; // Unique per probe so a late reply cant land on the wrong slot
-    struct timespec t0 = probe_gonder(sock, hedef, ttl, seq);
-    Cevap c = cevap_bekle(sock, seq, t0);
+    struct timespec t0 = send_probe(sock, target, ttl, seq);
+    Reply c = wait_reply(sock, seq, t0);
 
     h.rtt[p] = c.rtt;                             // Stores this probe's RTT, stays -1 if it timed out
     if (c.rtt >= 0) strcpy(h.ip, c.ip);           // Keeps the responder from whichever probe answered
@@ -157,7 +157,7 @@ Hop hop_izle(int sock, struct sockaddr_in *hedef, int ttl) {
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Print Hop _____________________________________________________________________________________
-void hop_bas(int ttl, Hop *h) {
+void print_hop(int ttl, Hop *h) {
   if (h->ip[0] == 0) { printf("%2d  * * *\n", ttl); return; } // No probe answered at all, dead or filtered
   printf("%2d  %-15s", ttl, h->ip);                           // Hop number and responder
   for (int p = 0; p < PROBES; p++)                            // Then one column per probe
@@ -168,17 +168,17 @@ void hop_bas(int ttl, Hop *h) {
 
 // Logic _________________________________________________________________________________________
 int main(int argc, char *argv[]) {
-  const char *hedef_ip = (argc > 1) ? argv[1] : "8.8.8.8"; // Defaults to Google DNS if no arg given
+  const char *target_ip = (argc > 1) ? argv[1] : "8.8.8.8"; // Defaults to Google DNS if no arg given
 
-  struct sockaddr_in hedef = hedefi_coz(hedef_ip); // Validates the arg before hitting the root wall
-  int sock = icmp_soket_ac();
+  struct sockaddr_in target = resolve_target(target_ip); // Validates the arg before hitting the root wall
+  int sock = open_icmp_socket();
 
-  printf("Traceroute to %s, %d hops max\n\n", hedef_ip, MAX_HOPS);
+  printf("Traceroute to %s, %d hops max\n\n", target_ip, MAX_HOPS);
 
   for (int ttl = 1; ttl <= MAX_HOPS; ttl++) {
-    Hop h = hop_izle(sock, &hedef, ttl);       // Fires 3 probes at this TTL, folds the answers
-    hop_bas(ttl, &h);                          // Prints the row
-    if (h.reached) { printf("\nHedefe ulasildi\n"); break; } // Stops once the target itself answers
+    Hop h = track_hop(sock, &target, ttl);       // Fires 3 probes at this TTL, folds the answers
+    print_hop(ttl, &h);                          // Prints the row
+    if (h.reached) { printf("\nReached the target\n"); break; } // Stops once the target itself answers
   }
   close(sock);
   return 0;
