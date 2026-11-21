@@ -1,21 +1,22 @@
 # Signal Commander
 
-A terminal UI for ICMP network diagnostics — traceroute and ping — built from
-scratch in C with raw sockets and ncurses. Nothing beyond libc and ncurses:
-every ICMP packet is hand-assembled and every reply is parsed byte by byte.
+A terminal UI for ICMP network diagnostics (traceroute and ping), built from
+scratch in C with raw sockets and ncurses. It needs nothing beyond libc and
+ncurses. Every ICMP packet is assembled by hand and every reply is parsed byte
+by byte.
 
-<!-- Add a screenshot or GIF here, e.g. docs/track-signal.png -->
+<!-- TODO: add a screenshot or GIF here, e.g. docs/track-signal.png -->
 
 ## Features
 
-- **Configuration** — edit target host, port, TTL and protocol in a navigable
+- **Configuration.** Edit target host, port, TTL and protocol in a navigable
   form with per-field validation (IPv4 format, integer ranges, cycling options).
-- **Track Signal** — live traceroute. Climbs the TTL hop by hop, 3 probes per
-  hop, and fills the table as replies arrive. Fully non-blocking: the UI stays
-  responsive and ESC aborts mid-trace.
-- **Send Signal** — continuous ping with a rolling result window and live
+- **Track Signal.** Live traceroute. It climbs the TTL hop by hop with 3 probes
+  per hop and fills the table as replies arrive. The loop never blocks, so the
+  UI stays responsive and ESC aborts a trace midway.
+- **Send Signal.** Continuous ping with a rolling result window and live
   min / avg / max and packet-loss statistics.
-- **`trace`** — a standalone CLI traceroute sharing the same engine.
+- **`trace`.** A standalone CLI traceroute that shares the same engine.
 
 ## Build
 
@@ -41,8 +42,8 @@ make setcap
 
 ## Usage
 
-- `./signal_commander` — the TUI. Arrow keys navigate, Enter selects, ESC / q backs out.
-- `./trace <ipv4>` — standalone traceroute to a single target.
+- `./signal_commander` starts the TUI. Arrow keys navigate, Enter selects, and ESC or q backs out.
+- `./trace <ipv4>` runs a standalone traceroute to a single target.
 
 ## Design notes
 
@@ -56,13 +57,13 @@ make setcap
   reveals the path one hop at a time. The destination replies with an Echo Reply
   instead, which is how the trace knows it has arrived.
 - **Non-blocking FSM.** A TUI must never freeze, but waiting for a reply is
-  inherently blocking. Track Signal is a small state machine (SEND -> WAIT -> DONE)
-  driven by a tick loop: `select()` polls the socket with a short timeout while
-  the keyboard is polled separately, so the table updates live and ESC is always
-  responsive.
+  inherently blocking. Track Signal is a small state machine with SEND, WAIT and
+  DONE states, driven by a tick loop. On each tick `select()` polls the socket
+  with a short timeout while the keyboard is polled separately, so the table
+  updates live and ESC always responds.
 - **Unique per-probe sequence numbers.** Each probe is stamped with a unique ICMP
-  sequence (`ttl * PROBES + probe`), so a late reply can't be mis-attributed to
-  another probe — and it lays the groundwork for firing probes in parallel.
+  sequence (`ttl * PROBES + probe`), so a late reply can't be attributed to the
+  wrong probe. This also lays the groundwork for firing probes in parallel.
 - **Embedded-packet parsing.** A Time Exceeded reply carries the original probe's
   IP header plus the first 8 bytes of its payload. The parser digs through the
   outer IP header, the 8-byte Time Exceeded header and the embedded IP header to
@@ -72,14 +73,15 @@ make setcap
 
 ## Status
 
-Working: ICMP traceroute and ping, configuration.
+ICMP traceroute, ping and the configuration screen work today.
 
-Planned: TCP and UDP probing (SYN / ICMP port-unreachable), a Settings screen,
-a scrollable hop table, optional DNS resolution, and parallel (pipelined) probing.
+Planned work includes TCP and UDP probing (SYN / ICMP port-unreachable), a
+Settings screen, a scrollable hop table, optional DNS resolution, and parallel
+(pipelined) probing.
 
 ## Requirements & notes
 
-- Linux only — raw sockets. On Windows, WSL2 works because it runs a real kernel.
+- Linux only, because it uses raw sockets. On Windows, WSL2 works because it runs a real kernel.
 - IPv4 only for now.
 
 ## License
