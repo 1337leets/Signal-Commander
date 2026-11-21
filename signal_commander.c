@@ -647,7 +647,11 @@ static const char *flag_yazi(char f) {
     return "";
 }
 
-static void draw_track(HopResult *hops, int count, int running, const char *etiket, int probes) {
+/* scroll_off = tablonun en ustunde gorunen hop indeksi. takip = 1 iken
+ * her cizimde en alta yapisir (yeni hop'lar hep gorunur). Sinirlar burada
+ * kirpilir, cunku kac satir sigdigini sadece cizim ani biliyor. */
+static void draw_track(HopResult *hops, int count, int running, const char *etiket, int probes,
+                       int *scroll_off, int *takip) {
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -662,6 +666,10 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
     int shown   = (count < maxrows) ? count : maxrows;
     if (shown < 0) shown = 0;
     int bottom  = first + shown;            /* alt cerceve satiri */
+
+    int max_off = count - shown;            /* en alttaki pencere */
+    if (*takip || *scroll_off >= max_off) { *scroll_off = max_off; *takip = 1; } /* dibe gelince takibe don */
+    if (*scroll_off < 0) *scroll_off = 0;
 
     /* ust cerceve + basliklar */
     draw_hline(y, x, w, ACS_ULCORNER, ACS_URCORNER, -1, 0);
@@ -687,7 +695,7 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
     for (int i = 0; i < shown; i++) {
         int ry = first + i;
         mvaddch(ry, x, ACS_VLINE); mvaddch(ry, x + w - 1, ACS_VLINE);
-        HopResult *h = &hops[i];
+        HopResult *h = &hops[*scroll_off + i];          /* pencere kaydirilmis olabilir */
 
         if (h->ip[0] == '\0') {                         /* hic cevap yok */
             mvprintw(ry, x + 2, "%2d   * * *", h->hop);
@@ -705,6 +713,8 @@ static void draw_track(HopResult *hops, int count, int running, const char *etik
 
     draw_hline(bottom, x, w, ACS_LLCORNER, ACS_LRCORNER, -1, 0);
     mvprintw(bottom + 2, x, "  [ ESC ] abort   [ UP/DOWN ] scroll");
+    if (count > shown && shown > 0)                     /* sigmiyorsa nerede oldugumuzu goster */
+        printw("   hops %d-%d of %d", *scroll_off + 1, *scroll_off + shown, count);
     refresh();
 }
 
@@ -1070,6 +1080,7 @@ void track_signal(void) {
     int ttl = 1, probe = 0, count = 0, seq = 0;
     int state = ST_SEND, running = 1;
     struct timespec sent_at = {0, 0};
+    int scroll_off = 0, takip = 1;             /* tablo penceresi, baslangicta en alti takip et */
 
     nodelay(stdscr, TRUE);                     /* getch bloklamasin, dongu donsun */
 
@@ -1077,6 +1088,8 @@ void track_signal(void) {
         /* ── 1. Klavye ──────────────────────────────── */
         int k = getch();
         if (k == 27 || k == 'q' || k == 'Q') break;   /* ESC -> menuye don */
+        if (k == KEY_UP)   { scroll_off--; takip = 0; }  /* yukari bakan takibi birakir */
+        if (k == KEY_DOWN) { scroll_off++; }             /* dibe varinca draw_track takibi geri acar */
 
         /* ── 2. FSM adimi ───────────────────────────── */
         if (state == ST_SEND) {
@@ -1130,7 +1143,7 @@ void track_signal(void) {
         }
 
         /* ── 3. Ciz ─────────────────────────────────── */
-        draw_track(hops, count, running, etiket, probes);
+        draw_track(hops, count, running, etiket, probes, &scroll_off, &takip);
     }
 
     motor_kapat(&m);
