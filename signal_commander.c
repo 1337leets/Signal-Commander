@@ -17,6 +17,7 @@
 #include <netinet/ip.h>       /* struct iphdr */
 #include <netinet/ip_icmp.h>  /* struct icmphdr, ICMP_* */
 #include <netinet/tcp.h>      /* struct tcphdr */
+#include <netinet/udp.h>      /* struct udphdr */
 #include <stdint.h>           /* uint16_t, uint32_t */
 
 #define MAX_HOPS    30
@@ -45,7 +46,7 @@ typedef struct {
     char   ip[INET_ADDRSTRLEN];  /* bos ise hicbir probe cevap vermedi -> * * * */
     double rtt[PROBES];          /* -1 = o probe timeout */
     int    reached;              /* 1 = hedefin kendisi cevapladi */
-    char   flag;                 /* TCP: 'O' acik, 'C' kapali, 'U' ulasilamaz. 0 = duz hop */
+    char   flag;                 /* TCP/UDP: 'O' acik, 'C' kapali, 'U' ulasilamaz. 0 = duz hop */
 } HopResult;
 
 /* Bir ping sonucu: seq numarasi + rtt. ok=0 ise timeout (flag 'U' ise unreachable) */
@@ -707,13 +708,14 @@ struct pseudo_hdr {
 };
 
 /* Bir oturumun (track ya da send) motoru: protokol, soketler, kimlik.
- * ICMP'de sadece isock dolu. TCP'de tsock + src + sport da var. */
+ * ICMP'de sadece isock dolu. TCP'de tsock + src + sport da var.
+ * UDP'de sport bir port blogunun basi, probe'lar ayri soketlerden gider. */
 typedef struct {
-    int                proto;     /* IPPROTO_ICMP ya da IPPROTO_TCP */
-    struct sockaddr_in hedef;     /* sin_port sadece TCP'de anlamli */
+    int                proto;     /* IPPROTO_ICMP, IPPROTO_TCP ya da IPPROTO_UDP */
+    struct sockaddr_in hedef;     /* sin_port TCP ve UDP'de anlamli */
     struct in_addr     src;       /* pseudo-header icin kaynak ip */
     unsigned short     my_id;     /* pid, imzam */
-    uint16_t           sport;     /* TCP kaynak portu, oturum boyu sabit */
+    uint16_t           sport;     /* TCP: sabit kaynak port. UDP: blok basi */
     int                isock;     /* raw ICMP: echo reply, time exceeded, unreachable */
     int                tsock;     /* raw TCP: SYN at, SYN-ACK / RST dinle. ICMP'de -1 */
 } Motor;
@@ -766,17 +768,58 @@ static struct timespec tcp_probe_gonder(Motor *m, int ttl, uint32_t seq) {
     return t;
 }
 
-/* Protokole gore dogru probe'u at. tag = ICMP seq ya da TCP seq'in alt yarisi */
+/* ═══════════════════════════════════════════════════
+ *  UDP MOTORU  (kernel gonderir)
+ *
+ *  udptrace.c'den gelen kutular. Datagrami kernel kuruyor,
+ *  biz sadece TTL ve kaynak portu seciyoruz. Router'lar
+ *  Time Exceeded, hedef Port Unreachable ile cevap veriyor,
+ *  ikisi de raw ICMP soketinden okunuyor.
+ *
+ *  Kimlik: ICMP quote'unun 8 bayti UDP header'in tamami.
+ *  Hedef port config'den sabit, o yuzden etiket kaynak
+ *  portta: port = blok basi + tag % UDP_BLOK. Bedeli:
+ *  5-tuple probe'dan probe'a degisir, ECMP yolu oynayabilir.
+ * ═══════════════════════════════════════════════════ */
+#define UDP_BLOK 100                   /* oturum basina port, track en fazla 92 etiket kullanir */
+
+static uint16_t udp_port(const Motor *m, int tag) {
+    return m->sport + (uint16_t)(tag % UDP_BLOK);
+}
+
+/* Tek datagram: taze soket, etiket portuna bind, TTL, bos payload, kapat.
+ * bind ya da sendto patlarsa {0,0} doner, FSM o probe'u hemen timeout sayar. */
+static struct timespec udp_probe_gonder(Motor *m, int ttl, int tag) {
+    struct timespec t = {0, 0};
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return t;
+
+    struct sockaddr_in yerel; memset(&yerel, 0, sizeof(yerel));
+    yerel.sin_family = AF_INET; yerel.sin_addr.s_addr = htonl(INADDR_ANY);
+    yerel.sin_port = htons(udp_port(m, tag));                  /* kaynak port = probe etiketi */
+    if (bind(s, (struct sockaddr *)&yerel, sizeof(yerel)) < 0) { close(s); return t; }
+    setsockopt(s, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));      /* her hop'ta artan tek sey */
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if (sendto(s, "", 0, 0, (struct sockaddr *)&m->hedef, sizeof(m->hedef)) < 0) {
+        t.tv_sec = 0; t.tv_nsec = 0;                            /* hic cikmadi */
+    }
+    close(s);                                                  /* cevap zaten raw ICMP soketine gelir */
+    return t;
+}
+
+/* Protokole gore dogru probe'u at. tag = ICMP seq, TCP seq'in alt yarisi ya da UDP port ofseti */
 static struct timespec probe_at(Motor *m, int ttl, int tag) {
     if (m->proto == IPPROTO_TCP) return tcp_probe_gonder(m, ttl, syn_seq(m, tag));
+    if (m->proto == IPPROTO_UDP) return udp_probe_gonder(m, ttl, tag);
     return probe_gonder(m->isock, &m->hedef, ttl, tag);
 }
 
 /* ICMP soketinden gelen paketi coz: bizim probe'umuzun cevabi mi?
  * Evetse ip_out'a cevaplayani, reached_out'a "dur" kararini,
- * flag_out'a TCP karar harfini yazar, 1 doner.
+ * flag_out'a karar harfini yazar, 1 doner.
  * Gomulu paketin protokolune gore dallanir: ICMP'de id + seq,
- * TCP'de portlar + seq ile eslesir. */
+ * TCP'de portlar + seq, UDP'de portlar ile eslesir. */
 static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int tag,
                      char *ip_out, int *reached_out, char *flag_out) {
     if (n < (int)sizeof(struct iphdr) + (int)sizeof(struct icmphdr)) return 0;
@@ -786,7 +829,7 @@ static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int
     *flag_out = 0;
 
     if (icmp->type == ICMP_ECHOREPLY) {                     /* A: hedef cevapladi */
-        if (m->proto != IPPROTO_ICMP) return 0;             /* TCP modunda echo reply bizim olamaz */
+        if (m->proto != IPPROTO_ICMP) return 0;             /* TCP/UDP modunda echo reply bizim olamaz */
         if (ntohs(icmp->un.echo.id) != m->my_id ||
             ntohs(icmp->un.echo.sequence) != tag) return 0; /* benim degil */
         *reached_out = 1;
@@ -803,14 +846,23 @@ static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int
             struct icmphdr *iicmp = (struct icmphdr *)(buf + off + iiplen); /* gomulu echo header'im */
             if (ntohs(iicmp->un.echo.id) != m->my_id ||
                 ntohs(iicmp->un.echo.sequence) != tag) return 0;            /* benim probe'um degil */
-        } else {
+        } else if (m->proto == IPPROTO_TCP) {
             if (iip->daddr != m->hedef.sin_addr.s_addr) return 0;           /* baska hedefe giden SYN */
             struct tcphdr *itcp = (struct tcphdr *)(buf + off + iiplen);    /* portlar + seq, otesi yok */
             if (ntohs(itcp->source) != m->sport || itcp->dest != m->hedef.sin_port ||
                 ntohl(itcp->seq) != syn_seq(m, tag)) return 0;              /* benim SYN'im degil */
+        } else {
+            if (iip->daddr != m->hedef.sin_addr.s_addr) return 0;           /* baska hedefe giden datagram */
+            struct udphdr *iudp = (struct udphdr *)(buf + off + iiplen);    /* quote'un 8 bayti tam UDP header */
+            if (ntohs(iudp->source) != udp_port(m, tag) ||
+                iudp->dest != m->hedef.sin_port) return 0;                  /* benim datagramim degil */
         }
 
-        if (icmp->type == ICMP_DEST_UNREACH) { *reached_out = 1; *flag_out = 'U'; } /* trace burada biter */
+        if (icmp->type == ICMP_DEST_UNREACH) {              /* trace burada biter */
+            *reached_out = 1;
+            *flag_out = (m->proto == IPPROTO_UDP && icmp->code == ICMP_PORT_UNREACH)
+                      ? 'C' : 'U';                          /* UDP'de port unreachable = hedefe vardik, port kapali */
+        }
         else *reached_out = 0;
     } else return 0;                                        /* alakasiz ICMP */
 
@@ -865,8 +917,7 @@ static int cevap_oku(Motor *m, int tag, int tick_us,
 }
 
 /* Config'e gore motoru kur. Hata varsa ekranda gosterilecek mesaji
- * doner, yoksa NULL. Hata durumunda da motor_kapat cagrilmali.
- * UDP henuz bagli degil, ICMP'ye duser (etiket bunu gosterir). */
+ * doner, yoksa NULL. Hata durumunda da motor_kapat cagrilmali. */
 static const char *motor_ac(Motor *m) {
     static int oturum = 0;                     /* her oturum yeni kaynak port */
     memset(m, 0, sizeof(*m));
@@ -875,10 +926,12 @@ static const char *motor_ac(Motor *m) {
     if (inet_pton(AF_INET, current_cfg.ip, &m->hedef.sin_addr) <= 0)
         return "Invalid target IP. Set a valid IPv4 in Configuration.";
 
-    m->proto = (strcmp(current_cfg.proto, "TCP") == 0) ? IPPROTO_TCP : IPPROTO_ICMP;
+    if      (strcmp(current_cfg.proto, "TCP") == 0) m->proto = IPPROTO_TCP;
+    else if (strcmp(current_cfg.proto, "UDP") == 0) m->proto = IPPROTO_UDP;
+    else                                            m->proto = IPPROTO_ICMP;
     m->my_id = getpid() & 0xFFFF;
 
-    m->isock = icmp_soket_ac();                /* TCP'de de lazim: time exceeded buradan gelir */
+    m->isock = icmp_soket_ac();                /* TCP/UDP'de de lazim: time exceeded buradan gelir */
     if (m->isock < 0) return "Cannot open raw socket. Run with sudo (root needed).";
 
     if (m->proto == IPPROTO_TCP) {
@@ -889,6 +942,11 @@ static const char *motor_ac(Motor *m) {
         if (m->tsock < 0) return "Cannot open raw TCP socket. Run with sudo (root needed).";
         m->sport = 40000 + ((getpid() + oturum++) % 20000);  /* gec gelen eski SYN-ACK karismasin */
     }
+    if (m->proto == IPPROTO_UDP) {
+        if (current_cfg.port < 1) return "UDP needs a port between 1 and 65535.";
+        m->hedef.sin_port = htons(current_cfg.port);
+        m->sport = 40000 + ((getpid() + oturum++) % 200) * UDP_BLOK;  /* oturum basina ayri blok */
+    }
     return NULL;
 }
 
@@ -898,10 +956,11 @@ static void motor_kapat(Motor *m) {
     m->isock = m->tsock = -1;
 }
 
-/* Basliktaki protokol etiketi: "ICMP" ya da "TCP 443" */
+/* Basliktaki protokol etiketi: "ICMP", "TCP 443" ya da "UDP 33434" */
 static void motor_etiket(const Motor *m, char *out, int len) {
-    if (m->proto == IPPROTO_TCP) snprintf(out, len, "TCP %d", ntohs(m->hedef.sin_port));
-    else                         snprintf(out, len, "ICMP");
+    if      (m->proto == IPPROTO_TCP) snprintf(out, len, "TCP %d", ntohs(m->hedef.sin_port));
+    else if (m->proto == IPPROTO_UDP) snprintf(out, len, "UDP %d", ntohs(m->hedef.sin_port));
+    else                              snprintf(out, len, "ICMP");
 }
 
 /* Motor kurulamadiysa sebebini goster, tusa basinca menuye don */
