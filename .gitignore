@@ -1,0 +1,17 @@
+# compiled binaries
+signal_commander
+trace
+*.o
+*.out
+a.out
+
+# editor / OS junk
+*.swp
+*~
+.vscode/
+.DS_Store
+
+# captures / scratch
+*.pcap
+*.pcapng
+son.txt
