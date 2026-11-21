@@ -16,6 +16,8 @@
 #include <sys/select.h>       /* select, fd_set */
 #include <netinet/ip.h>       /* struct iphdr */
 #include <netinet/ip_icmp.h>  /* struct icmphdr, ICMP_* */
+#include <netinet/tcp.h>      /* struct tcphdr */
+#include <stdint.h>           /* uint16_t, uint32_t */
 
 #define MAX_HOPS    30
 #define PROBES      3
@@ -43,13 +45,15 @@ typedef struct {
     char   ip[INET_ADDRSTRLEN];  /* bos ise hicbir probe cevap vermedi -> * * * */
     double rtt[PROBES];          /* -1 = o probe timeout */
     int    reached;              /* 1 = hedefin kendisi cevapladi */
+    char   flag;                 /* TCP: 'O' acik, 'C' kapali, 'U' ulasilamaz. 0 = duz hop */
 } HopResult;
 
-/* Bir ping sonucu: seq numarasi + rtt. ok=0 ise timeout */
+/* Bir ping sonucu: seq numarasi + rtt. ok=0 ise timeout (flag 'U' ise unreachable) */
 typedef struct {
     int    seq;
     double rtt;
     int    ok;
+    char   flag;                 /* HopResult ile ayni harfler */
 } PingSat;
 
 /* ═══════════════════════════════════════════════════
@@ -572,7 +576,15 @@ void open_configuration(void) {
 /* ═══════════════════════════════════════════════════
  *  TRACK SIGNAL — HOP TABLOSU CIZIMI
  * ═══════════════════════════════════════════════════ */
-static void draw_track(HopResult *hops, int count, int running) {
+/* Flag harfini ekranda okunur hale getir */
+static const char *flag_yazi(char f) {
+    if (f == 'O') return "open";
+    if (f == 'C') return "closed";
+    if (f == 'U') return "!U";
+    return "";
+}
+
+static void draw_track(HopResult *hops, int count, int running, const char *etiket) {
     erase();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -590,6 +602,7 @@ static void draw_track(HopResult *hops, int count, int running) {
     /* ust cerceve + basliklar */
     draw_hline(y, x, w, ACS_ULCORNER, ACS_URCORNER, -1, 0);
     mvprintw(y, x + 2, "[ TRACK SIGNAL ]");
+    mvprintw(y, x + 19, "[ %s ]", etiket);           /* hangi protokol + port ile */
     const char *st = running ? "[ RUNNING ]" : "[ DONE ]";
     mvprintw(y, x + w - (int)strlen(st) - 2, "%s", st);
 
@@ -621,6 +634,8 @@ static void draw_track(HopResult *hops, int count, int running) {
                 (h->rtt[p] < 0) ? mvprintw(ry, cx, "%6s", "*")
                                 : mvprintw(ry, cx, "%6.2f ms", h->rtt[p]);
             }
+            if (h->flag && x + 54 + 6 < x + w - 1)     /* TCP karari, cerceveye tasmasin */
+                mvprintw(ry, x + 54, "%s", flag_yazi(h->flag));
         }
     }
 
@@ -669,34 +684,232 @@ static struct timespec probe_gonder(int sock, struct sockaddr_in *hedef, int ttl
     return t;
 }
 
-/* Gelen paketi coz: bizim probe'umuzun cevabi mi?
- * Evetse ip_out'a cevaplayani, reached_out'a "hedef mi" (echo reply) yazar, 1 doner.
- * trace.c'deki cevap_bekle'nin beyni, ama bloklayan recvfrom dongusu olmadan. */
-static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak,
-                     unsigned short my_id, int beklenen_seq,
-                     char *ip_out, int *reached_out) {
+/* ═══════════════════════════════════════════════════
+ *  TCP MOTORU  (raw SYN)
+ *
+ *  tcptrace.c'den gelen kanitlanmis kutular. SYN'i elle
+ *  kuruyoruz, IP header'i kernel kuruyor. Router'lar ICMP
+ *  Time Exceeded ile, hedef SYN-ACK (acik) ya da RST
+ *  (kapali) ile cevap veriyor.
+ *
+ *  Kimlik: kaynak port oturum boyu sabit (ECMP ayni yolu
+ *  secsin), probe etiketi TCP seq'in icinde:
+ *  seq = pid << 16 | tag. ICMP quote'unda ilk 8 bayt
+ *  (portlar + seq) garanti, eslestirme oradan.
+ * ═══════════════════════════════════════════════════ */
+
+/* TCP checksum'in kapsadigi ama gonderilmeyen 12 bayt.
+ * Kernel'in kuracagi IP header'in ozeti. */
+struct pseudo_hdr {
+    uint32_t src, dst;            /* kaynak + hedef ip, network order */
+    uint8_t  zero, proto;         /* hep 0, sonra IPPROTO_TCP */
+    uint16_t len;                 /* TCP header + payload uzunlugu */
+};
+
+/* Bir oturumun (track ya da send) motoru: protokol, soketler, kimlik.
+ * ICMP'de sadece isock dolu. TCP'de tsock + src + sport da var. */
+typedef struct {
+    int                proto;     /* IPPROTO_ICMP ya da IPPROTO_TCP */
+    struct sockaddr_in hedef;     /* sin_port sadece TCP'de anlamli */
+    struct in_addr     src;       /* pseudo-header icin kaynak ip */
+    unsigned short     my_id;     /* pid, imzam */
+    uint16_t           sport;     /* TCP kaynak portu, oturum boyu sabit */
+    int                isock;     /* raw ICMP: echo reply, time exceeded, unreachable */
+    int                tsock;     /* raw TCP: SYN at, SYN-ACK / RST dinle. ICMP'de -1 */
+} Motor;
+
+/* TCP seq: ust 16 bit pid, alt 16 bit probe etiketi */
+static uint32_t syn_seq(const Motor *m, int tag) {
+    return ((uint32_t)m->my_id << 16) | (uint16_t)tag;
+}
+
+/* Pseudo-header kaynak ip istiyor ama onu kernel seciyor. Connect
+ * edilmis UDP soketi kernel'e rota aramasi yaptirir, getsockname
+ * cevabi verir. Kabloya hicbir sey cikmaz. 0 = rota yok. */
+static int kaynak_ip_bul(struct sockaddr_in *hedef, struct in_addr *out) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;
+    if (connect(s, (struct sockaddr *)hedef, sizeof(*hedef)) < 0) { close(s); return 0; }
+    struct sockaddr_in yerel; socklen_t l = sizeof(yerel);
+    int ok = (getsockname(s, (struct sockaddr *)&yerel, &l) == 0);
+    close(s);
+    if (ok) *out = yerel.sin_addr;
+    return ok;
+}
+
+/* Tek SYN kur ve at. pseudo + TCP header yan yana, ikisinin
+ * checksum'i alinir, sadece TCP kismi gonderilir. */
+static struct timespec tcp_probe_gonder(Motor *m, int ttl, uint32_t seq) {
+    setsockopt(m->tsock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));   /* her hop'ta artan tek sey */
+
+    char packet[sizeof(struct pseudo_hdr) + sizeof(struct tcphdr)];
+    memset(packet, 0, sizeof(packet));
+    struct pseudo_hdr *ph  = (struct pseudo_hdr *)packet;
+    struct tcphdr     *tcp = (struct tcphdr *)(packet + sizeof(struct pseudo_hdr));
+
+    tcp->source = htons(m->sport);             /* oturum boyu sabit */
+    tcp->dest   = m->hedef.sin_port;           /* test edilen port */
+    tcp->seq    = htonl(seq);                  /* pid + etiket, ICMP quote'unda geri gelir */
+    tcp->doff   = 5;                           /* 20 bayt, opsiyon yok */
+    tcp->syn    = 1;
+    tcp->window = htons(64240);                /* makul pencere, 0'i dusuren kutular var */
+
+    ph->src   = m->src.s_addr;                 /* kernel'in basacagi kaynak */
+    ph->dst   = m->hedef.sin_addr.s_addr;
+    ph->proto = IPPROTO_TCP;
+    ph->len   = htons(sizeof(struct tcphdr));
+    tcp->check = checksum(packet, sizeof(packet));   /* alan 0'ken hesapla */
+
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    if (sendto(m->tsock, tcp, sizeof(struct tcphdr), 0,
+               (struct sockaddr *)&m->hedef, sizeof(m->hedef)) < 0) { /* patlarsa timeout gorunur */ }
+    return t;
+}
+
+/* Protokole gore dogru probe'u at. tag = ICMP seq ya da TCP seq'in alt yarisi */
+static struct timespec probe_at(Motor *m, int ttl, int tag) {
+    if (m->proto == IPPROTO_TCP) return tcp_probe_gonder(m, ttl, syn_seq(m, tag));
+    return probe_gonder(m->isock, &m->hedef, ttl, tag);
+}
+
+/* ICMP soketinden gelen paketi coz: bizim probe'umuzun cevabi mi?
+ * Evetse ip_out'a cevaplayani, reached_out'a "dur" kararini,
+ * flag_out'a TCP karar harfini yazar, 1 doner.
+ * Gomulu paketin protokolune gore dallanir: ICMP'de id + seq,
+ * TCP'de portlar + seq ile eslesir. */
+static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int tag,
+                     char *ip_out, int *reached_out, char *flag_out) {
     if (n < (int)sizeof(struct iphdr) + (int)sizeof(struct icmphdr)) return 0;
     struct iphdr *ip = (struct iphdr *)buf; int iplen = ip->ihl * 4;    /* dis IP header'i atla */
     if (n < iplen + (int)sizeof(struct icmphdr)) return 0;
     struct icmphdr *icmp = (struct icmphdr *)(buf + iplen);
+    *flag_out = 0;
 
     if (icmp->type == ICMP_ECHOREPLY) {                     /* A: hedef cevapladi */
-        if (ntohs(icmp->un.echo.id) != my_id ||
-            ntohs(icmp->un.echo.sequence) != beklenen_seq) return 0;    /* benim degil */
+        if (m->proto != IPPROTO_ICMP) return 0;             /* TCP modunda echo reply bizim olamaz */
+        if (ntohs(icmp->un.echo.id) != m->my_id ||
+            ntohs(icmp->un.echo.sequence) != tag) return 0; /* benim degil */
         *reached_out = 1;
-    } else if (icmp->type == ICMP_TIME_EXCEEDED) {          /* B: router TTL'i bitirdi */
+    } else if (icmp->type == ICMP_TIME_EXCEEDED ||          /* B: router TTL'i bitirdi */
+               icmp->type == ICMP_DEST_UNREACH) {           /* C: biri yolu kesti */
         int off = iplen + 8;                                /* dis IP + 8 bayt -> gomulu original */
         if (n < off + (int)sizeof(struct iphdr)) return 0;
         struct iphdr *iip = (struct iphdr *)(buf + off); int iiplen = iip->ihl * 4;
-        if (n < off + iiplen + (int)sizeof(struct icmphdr)) return 0;
-        struct icmphdr *iicmp = (struct icmphdr *)(buf + off + iiplen); /* gomulu echo header'im */
-        if (ntohs(iicmp->un.echo.id) != my_id ||
-            ntohs(iicmp->un.echo.sequence) != beklenen_seq) return 0;   /* benim probe'um degil */
-        *reached_out = 0;
+        if (iip->protocol != m->proto) return 0;            /* baska protokolun hatasi */
+        if (n < off + iiplen + 8) return 0;                 /* sadece 8 bayt garanti */
+
+        if (m->proto == IPPROTO_ICMP) {
+            if (icmp->type != ICMP_TIME_EXCEEDED) return 0; /* ICMP modunda unreachable eskisi gibi yok sayilir */
+            struct icmphdr *iicmp = (struct icmphdr *)(buf + off + iiplen); /* gomulu echo header'im */
+            if (ntohs(iicmp->un.echo.id) != m->my_id ||
+                ntohs(iicmp->un.echo.sequence) != tag) return 0;            /* benim probe'um degil */
+        } else {
+            if (iip->daddr != m->hedef.sin_addr.s_addr) return 0;           /* baska hedefe giden SYN */
+            struct tcphdr *itcp = (struct tcphdr *)(buf + off + iiplen);    /* portlar + seq, otesi yok */
+            if (ntohs(itcp->source) != m->sport || itcp->dest != m->hedef.sin_port ||
+                ntohl(itcp->seq) != syn_seq(m, tag)) return 0;              /* benim SYN'im degil */
+        }
+
+        if (icmp->type == ICMP_DEST_UNREACH) { *reached_out = 1; *flag_out = 'U'; } /* trace burada biter */
+        else *reached_out = 0;
     } else return 0;                                        /* alakasiz ICMP */
 
     inet_ntop(AF_INET, &kaynak->sin_addr, ip_out, INET_ADDRSTRLEN);     /* cevaplayanin adresi */
     return 1;
+}
+
+/* TCP soketinden gelen paketi coz: hedef SYN'imize SYN-ACK ya da RST mi dondu?
+ * Portlar + ack = seq + 1 tutmali. Raw TCP soketi hosttaki BUTUN TCP'nin
+ * kopyasini aliyor, filtre sart. */
+static int tcp_coz(char *buf, int n, struct sockaddr_in *kaynak, Motor *m, int tag,
+                   char *ip_out, int *reached_out, char *flag_out) {
+    if (n < (int)sizeof(struct iphdr)) return 0;
+    struct iphdr *ip = (struct iphdr *)buf; int iplen = ip->ihl * 4;
+    if (ip->saddr != m->hedef.sin_addr.s_addr) return 0;                  /* hedeften gelmiyor */
+    if (n < iplen + (int)sizeof(struct tcphdr)) return 0;
+    struct tcphdr *tcp = (struct tcphdr *)(buf + iplen);
+    if (tcp->source != m->hedef.sin_port || ntohs(tcp->dest) != m->sport) return 0; /* baska baglanti */
+    if (!tcp->ack || ntohl(tcp->ack_seq) != syn_seq(m, tag) + 1) return 0;          /* baska SYN'in cevabi */
+
+    if (tcp->syn)      *flag_out = 'O';                    /* SYN-ACK, port acik */
+    else if (tcp->rst) *flag_out = 'C';                    /* RST, port kapali */
+    else return 0;
+    *reached_out = 1;
+    inet_ntop(AF_INET, &kaynak->sin_addr, ip_out, INET_ADDRSTRLEN);
+    return 1;
+}
+
+/* Bir tick boyunca soketleri yokla. Bizim cevap geldiyse 1 doner.
+ * select en fazla tick_us bekler, UI donmaz. Yabanci paketler
+ * sonraki turlarda bosalir. */
+static int cevap_oku(Motor *m, int tag, int tick_us,
+                     char *ip_out, int *reached_out, char *flag_out) {
+    fd_set rfds; FD_ZERO(&rfds); FD_SET(m->isock, &rfds);
+    int maxfd = m->isock;
+    if (m->tsock >= 0) { FD_SET(m->tsock, &rfds); if (m->tsock > maxfd) maxfd = m->tsock; }
+    struct timeval tv = { 0, tick_us };
+    if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) return 0;
+
+    char buf[1024]; struct sockaddr_in kaynak; socklen_t kl;
+    if (FD_ISSET(m->isock, &rfds)) {                        /* router, firewall ya da echo reply */
+        kl = sizeof(kaynak);
+        int n = recvfrom(m->isock, buf, sizeof(buf), 0, (struct sockaddr *)&kaynak, &kl);
+        if (n > 0 && paket_coz(buf, n, &kaynak, m, tag, ip_out, reached_out, flag_out)) return 1;
+    }
+    if (m->tsock >= 0 && FD_ISSET(m->tsock, &rfds)) {       /* hedefin kendisi */
+        kl = sizeof(kaynak);
+        int n = recvfrom(m->tsock, buf, sizeof(buf), 0, (struct sockaddr *)&kaynak, &kl);
+        if (n > 0 && tcp_coz(buf, n, &kaynak, m, tag, ip_out, reached_out, flag_out)) return 1;
+    }
+    return 0;
+}
+
+/* Config'e gore motoru kur. Hata varsa ekranda gosterilecek mesaji
+ * doner, yoksa NULL. Hata durumunda da motor_kapat cagrilmali.
+ * UDP henuz bagli degil, ICMP'ye duser (etiket bunu gosterir). */
+static const char *motor_ac(Motor *m) {
+    static int oturum = 0;                     /* her oturum yeni kaynak port */
+    memset(m, 0, sizeof(*m));
+    m->isock = m->tsock = -1;
+    m->hedef.sin_family = AF_INET;
+    if (inet_pton(AF_INET, current_cfg.ip, &m->hedef.sin_addr) <= 0)
+        return "Invalid target IP. Set a valid IPv4 in Configuration.";
+
+    m->proto = (strcmp(current_cfg.proto, "TCP") == 0) ? IPPROTO_TCP : IPPROTO_ICMP;
+    m->my_id = getpid() & 0xFFFF;
+
+    m->isock = icmp_soket_ac();                /* TCP'de de lazim: time exceeded buradan gelir */
+    if (m->isock < 0) return "Cannot open raw socket. Run with sudo (root needed).";
+
+    if (m->proto == IPPROTO_TCP) {
+        if (current_cfg.port < 1) return "TCP needs a port between 1 and 65535.";
+        m->hedef.sin_port = htons(current_cfg.port);
+        if (!kaynak_ip_bul(&m->hedef, &m->src)) return "No route to target.";
+        m->tsock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+        if (m->tsock < 0) return "Cannot open raw TCP socket. Run with sudo (root needed).";
+        m->sport = 40000 + ((getpid() + oturum++) % 20000);  /* gec gelen eski SYN-ACK karismasin */
+    }
+    return NULL;
+}
+
+static void motor_kapat(Motor *m) {
+    if (m->isock >= 0) close(m->isock);
+    if (m->tsock >= 0) close(m->tsock);
+    m->isock = m->tsock = -1;
+}
+
+/* Basliktaki protokol etiketi: "ICMP" ya da "TCP 443" */
+static void motor_etiket(const Motor *m, char *out, int len) {
+    if (m->proto == IPPROTO_TCP) snprintf(out, len, "TCP %d", ntohs(m->hedef.sin_port));
+    else                         snprintf(out, len, "ICMP");
+}
+
+/* Motor kurulamadiysa sebebini goster, tusa basinca menuye don */
+static void motor_hata(const char *msg) {
+    erase();
+    mvprintw(2, 4, "%s", msg);
+    mvprintw(4, 4, "Press any key to return.");
+    refresh(); getch();
 }
 
 /* ═══════════════════════════════════════════════════
@@ -715,25 +928,12 @@ static int paket_coz(char *buf, int n, struct sockaddr_in *kaynak,
 enum { ST_SEND, ST_WAIT, ST_DONE };
 
 void track_signal(void) {
-    /* Hedefi config'den al */
-    struct sockaddr_in hedef; memset(&hedef, 0, sizeof(hedef));
-    hedef.sin_family = AF_INET;
-    if (inet_pton(AF_INET, current_cfg.ip, &hedef.sin_addr) <= 0) {
-        erase();
-        mvprintw(2, 4, "Invalid target IP: %s", current_cfg.ip);
-        mvprintw(4, 4, "Set a valid IPv4 in Configuration.  Press any key.");
-        refresh(); getch(); return;
-    }
+    /* Hedefi + protokolu config'den al, soketleri ac */
+    Motor m;
+    const char *hata = motor_ac(&m);
+    if (hata) { motor_kapat(&m); motor_hata(hata); return; }   /* raw socket root ister */
+    char etiket[16]; motor_etiket(&m, etiket, sizeof(etiket));
 
-    int sock = icmp_soket_ac();
-    if (sock < 0) {                            /* raw socket root ister */
-        erase();
-        mvprintw(2, 4, "Cannot open raw socket. Run with sudo (root needed).");
-        mvprintw(4, 4, "Press any key to return.");
-        refresh(); getch(); return;
-    }
-
-    unsigned short my_id = getpid() & 0xFFFF;
     int limit = current_cfg.ttl;               /* config'deki TTL = max hop */
     if (limit > MAX_HOPS) limit = MAX_HOPS;
     if (limit < 1) limit = 1;
@@ -758,29 +958,25 @@ void track_signal(void) {
                 for (int p = 0; p < PROBES; p++) hops[ttl-1].rtt[p] = -1.0;
                 hops[ttl-1].ip[0] = '\0';
                 hops[ttl-1].reached = 0;
+                hops[ttl-1].flag = 0;
                 count = ttl;
             }
             seq = ttl * PROBES + probe;         /* probe basina benzersiz */
-            sent_at = probe_gonder(sock, &hedef, ttl, seq);
+            sent_at = probe_at(&m, ttl, seq);
             state = ST_WAIT;
         }
         else if (state == ST_WAIT) {
             int bitti = 0;                      /* bu probe icin karar verildi mi */
 
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(sock, &rfds);
-            struct timeval tv = { 0, 60000 };   /* 60 ms tick, UI donmaz */
-            if (select(sock + 1, &rfds, NULL, NULL, &tv) > 0 && FD_ISSET(sock, &rfds)) {
-                char buf[1024]; struct sockaddr_in kaynak; socklen_t kl = sizeof(kaynak);
-                int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&kaynak, &kl);
-                char ip[INET_ADDRSTRLEN]; int reached = 0;
-                if (n > 0 && paket_coz(buf, n, &kaynak, my_id, seq, ip, &reached)) {
-                    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-                    hops[ttl-1].rtt[probe] = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
-                                             (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
-                    strcpy(hops[ttl-1].ip, ip);
-                    if (reached) hops[ttl-1].reached = 1;
-                    bitti = 1;
-                }
+            char ip[INET_ADDRSTRLEN]; int reached = 0; char flag = 0;
+            if (cevap_oku(&m, seq, 60000, ip, &reached, &flag)) {   /* 60 ms tick, UI donmaz */
+                struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                hops[ttl-1].rtt[probe] = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
+                                         (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
+                strcpy(hops[ttl-1].ip, ip);
+                if (reached) hops[ttl-1].reached = 1;
+                if (flag)    hops[ttl-1].flag = flag;               /* TCP karari, herhangi bir probe'dan */
+                bitti = 1;
             }
 
             if (!bitti) {                       /* cevap yoksa deadline'a bak */
@@ -807,17 +1003,17 @@ void track_signal(void) {
         }
 
         /* ── 3. Ciz ─────────────────────────────────── */
-        draw_track(hops, count, running);
+        draw_track(hops, count, running, etiket);
     }
 
-    close(sock);
+    motor_kapat(&m);
     nodelay(stdscr, FALSE);                     /* menuye normal bloklayan getch ile don */
 }
 
 /* ═══════════════════════════════════════════════════
  *  SEND SIGNAL — PING TABLOSU CIZIMI
  * ═══════════════════════════════════════════════════ */
-static void draw_ping(const char *hedef_ip, PingSat *ring, int ring_count,
+static void draw_ping(const char *hedef_ip, const char *etiket, PingSat *ring, int ring_count,
                       int sent, int recv, double rmin, double rmax, double rsum,
                       int running) {
     erase();
@@ -842,7 +1038,7 @@ static void draw_ping(const char *hedef_ip, PingSat *ring, int ring_count,
 
     /* hedef satiri + kolon basliklari */
     mvaddch(y + 1, x, ACS_VLINE); mvaddch(y + 1, x + w - 1, ACS_VLINE);
-    mvprintw(y + 1, x + 2, "PING %s", hedef_ip);
+    mvprintw(y + 1, x + 2, "PING %s  [ %s ]", hedef_ip, etiket);
     mvaddch(y + 2, x, ACS_VLINE); mvaddch(y + 2, x + w - 1, ACS_VLINE);
     attron(A_BOLD);
     mvprintw(y + 2, x + 2, "SEQ");
@@ -856,8 +1052,10 @@ static void draw_ping(const char *hedef_ip, PingSat *ring, int ring_count,
         int ry = first + i;
         PingSat *p = &ring[(start + i) % PING_RING];
         mvaddch(ry, x, ACS_VLINE); mvaddch(ry, x + w - 1, ACS_VLINE);
-        if (p->ok) mvprintw(ry, x + 2, "%3d    time=%.2f ms", p->seq, p->rtt);
-        else       mvprintw(ry, x + 2, "%3d    timeout", p->seq);
+        if (p->ok)              mvprintw(ry, x + 2, "%3d    time=%.2f ms  %s", p->seq, p->rtt,
+                                         flag_yazi(p->flag));   /* TCP'de open / closed */
+        else if (p->flag == 'U') mvprintw(ry, x + 2, "%3d    unreachable", p->seq);
+        else                    mvprintw(ry, x + 2, "%3d    timeout", p->seq);
     }
 
     draw_hline(bottom, x, w, ACS_LTEE, ACS_RTEE, -1, 0);   /* stats ayiraci */
@@ -880,23 +1078,10 @@ static void draw_ping(const char *hedef_ip, PingSat *ring, int ring_count,
 
 /* ─── Send Signal ekrani (ping, ESC'e kadar surer) ─── */
 void send_signal(void) {
-    struct sockaddr_in hedef; memset(&hedef, 0, sizeof(hedef));
-    hedef.sin_family = AF_INET;
-    if (inet_pton(AF_INET, current_cfg.ip, &hedef.sin_addr) <= 0) {
-        erase();
-        mvprintw(2, 4, "Invalid target IP: %s", current_cfg.ip);
-        mvprintw(4, 4, "Set a valid IPv4 in Configuration.  Press any key.");
-        refresh(); getch(); return;
-    }
-    int sock = icmp_soket_ac();
-    if (sock < 0) {
-        erase();
-        mvprintw(2, 4, "Cannot open raw socket. Run with sudo (root needed).");
-        mvprintw(4, 4, "Press any key to return.");
-        refresh(); getch(); return;
-    }
-
-    unsigned short my_id = getpid() & 0xFFFF;
+    Motor m;
+    const char *hata = motor_ac(&m);
+    if (hata) { motor_kapat(&m); motor_hata(hata); return; }
+    char etiket[16]; motor_etiket(&m, etiket, sizeof(etiket));
 
     PingSat ring[PING_RING]; int ring_count = 0;
     int sent = 0, recv = 0, seq = 1;
@@ -912,44 +1097,43 @@ void send_signal(void) {
         if (k == 27 || k == 'q' || k == 'Q') break;
 
         if (state == ST_SEND) {
-            sent_at = probe_gonder(sock, &hedef, PING_TTL, seq);  /* TTL sabit, hedefe atiyoruz */
+            sent_at = probe_at(&m, PING_TTL, seq);   /* TTL sabit, hedefe atiyoruz */
             sent++; recorded = 0;
             state = ST_WAIT;
         }
         else {  /* ST_WAIT: 1 sn'lik pencere, cevap ya da timeout, sonra sonraki ping */
-            fd_set rfds; FD_ZERO(&rfds); FD_SET(sock, &rfds);
-            struct timeval tv = { 0, 60000 };
-            if (select(sock + 1, &rfds, NULL, NULL, &tv) > 0 && FD_ISSET(sock, &rfds)) {
-                char buf[1024]; struct sockaddr_in kaynak; socklen_t kl = sizeof(kaynak);
-                int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&kaynak, &kl);
-                char ip[INET_ADDRSTRLEN]; int reached = 0;
-                if (!recorded && n > 0 && paket_coz(buf, n, &kaynak, my_id, seq, ip, &reached)) {
-                    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-                    double rtt = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
-                                 (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
-                    ring[ring_count % PING_RING] = (PingSat){ seq, rtt, 1 };
-                    ring_count++; recv++;
+            char ip[INET_ADDRSTRLEN]; int reached = 0; char flag = 0;
+            int geldi = cevap_oku(&m, seq, 60000, ip, &reached, &flag);  /* her turda yokla, bos donmesin */
+            if (!recorded && geldi) {
+                struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                double rtt = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
+                             (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
+                if (flag == 'U') {                                  /* yol kesildi, basari sayilmaz */
+                    ring[ring_count % PING_RING] = (PingSat){ seq, rtt, 0, flag };
+                } else {
+                    ring[ring_count % PING_RING] = (PingSat){ seq, rtt, 1, flag };
+                    recv++;
                     if (recv == 1 || rtt < rmin) rmin = rtt;
                     if (rtt > rmax) rmax = rtt;
                     rsum += rtt;
-                    recorded = 1;
                 }
+                ring_count++; recorded = 1;
             }
 
             struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
             double gecen = (now.tv_sec - sent_at.tv_sec) * 1000.0 +
                            (now.tv_nsec - sent_at.tv_nsec) / 1000000.0;
             if (!recorded && gecen >= PING_INTERVAL_MS) {         /* pencere doldu, cevap yok */
-                ring[ring_count % PING_RING] = (PingSat){ seq, 0, 0 };
+                ring[ring_count % PING_RING] = (PingSat){ seq, 0, 0, 0 };
                 ring_count++; recorded = 1;
             }
             if (gecen >= PING_INTERVAL_MS) { seq++; state = ST_SEND; }  /* sonraki ping */
         }
 
-        draw_ping(current_cfg.ip, ring, ring_count, sent, recv, rmin, rmax, rsum, 1);
+        draw_ping(current_cfg.ip, etiket, ring, ring_count, sent, recv, rmin, rmax, rsum, 1);
     }
 
-    close(sock);
+    motor_kapat(&m);
     nodelay(stdscr, FALSE);
 }
 
